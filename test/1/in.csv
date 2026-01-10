@@ -1,0 +1,10 @@
+# Order 1: sell limit order for 5 MSFT shares at $100 per share.
+ORDER,1,MSFT,SELL,LIMIT,5,100
+# Orderbook: the top of orderbook should have - ask at 100 and no bid.
+ORDERBOOK,MSFT
+# Order 2: buy market order for 5 MSFT shares.
+ORDER,2,MSFT,BUY,MARKET,5
+# Execution: both order 1 and 2 are fully filled. 5 shares at $100.
+EXECUTION
+# Orderbook: the top of orderbook should have - no ask and no bid.
+ORDERBOOK,MSFT

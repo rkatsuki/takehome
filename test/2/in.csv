@@ -1,0 +1,8 @@
+# Order 1: sell market order for 5 MSFT shares.
+ORDER,1,MSFT,SELL,MARKET,5
+# Order 2: buy market order for 5 MSFT shares.
+ORDER,2,MSFT,BUY,MARKET,5
+# Orderbook: No market makers, no market. The top of orderbook should have - no ask and no bid.
+ORDERBOOK,MSFT
+# Execution: No order should have been executed.
+EXECUTION

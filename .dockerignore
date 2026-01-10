@@ -1,0 +1,29 @@
+# Docker ignore file
+
+# Reports
+reports/
+*.xml
+*.html
+
+# Git
+.git/
+.gitignore
+
+# Build artifacts (keep submission/build inside for docker)
+target/
+*.o
+*.a
+*.so
+
+# Documentation
+README.md
+EXERCISE.md
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+

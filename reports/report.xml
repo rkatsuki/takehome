@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="InterviewTests" tests="5" failures="5" errors="0" time="0" timestamp="2026-01-10T17:00:50+00:00">
+    <testcase name="test_1" classname="InterviewTests" time=".014348639">
+      <failure message="Test failed" type="AssertionError">Output mismatch</failure>
+    </testcase>
+    <testcase name="test_2" classname="InterviewTests" time=".008927870">
+      <failure message="Test failed" type="AssertionError">Output mismatch</failure>
+    </testcase>
+    <testcase name="test_3" classname="InterviewTests" time=".010940494">
+      <failure message="Test failed" type="AssertionError">Output mismatch</failure>
+    </testcase>
+    <testcase name="test_4" classname="InterviewTests" time=".008489172">
+      <failure message="Test failed" type="AssertionError">Output mismatch</failure>
+    </testcase>
+    <testcase name="test_5" classname="InterviewTests" time=".009296558">
+      <failure message="Test failed" type="AssertionError">Output mismatch</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
