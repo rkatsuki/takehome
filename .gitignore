@@ -1,1 +1,40 @@
-/.DS_Store
+# --- C++ Build Artifacts ---
+build/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.out
+
+# --- CMake Artifacts ---
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+_deps/
+
+# --- IDEs and Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.clangd/
+.cache/
+
+# --- Testing & Reports ---
+/test/report.xml
+/test/report.html
+/test/test_output.csv
+/reports/
+node_modules/
+.junit2html/
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+
+# --- Docker ---
+.docker/

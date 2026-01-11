@@ -7,13 +7,14 @@
     "customizations": {
         "vscode": {
             "extensions": [
+                // "llvm-vs-code-extensions.vscode-clangd",
                 "ms-vscode.cpptools",
                 "ms-vscode.cmake-tools",
-                "llvm-vs-code-extensions.vscode-clangd",
-                "ms-azuretools.vscode-docker"
+                "twinkery.ninja-tools"
             ]
         }
     },
     "remoteUser": "root",
-    "workspaceFolder": "/kraken_submission"
+    "workspaceFolder": "/kraken_submission",
+    "workspaceMount": "source=${localWorkspaceFolder}/submission,target=/kraken_submission,type=bind",
 }
