@@ -1,51 +1,42 @@
 #pragma once
-
 #include <map>
-#include <unordered_map>
-#include <vector>
-#include <functional>
-#include <shared_mutex>
-#include <optional>
-#include <string>
+#include <list>
 #include <mutex>
-#include <algorithm>
+#include <atomic>
+#include <vector>
+#include <string>
 
-#include "Order.hpp"
-
-struct BookTop {
-    double bestBid = 0.0;
-    double bestAsk = 0.0;
-    size_t bidLevels = 0;
-    size_t askLevels = 0;
-};
+#include "OrderRegistry.hpp"
 
 class OrderBook {
-private:
-    mutable std::shared_mutex bookMutex_;
-    
-    // Price-Time Priority: Bids (High to Low), Asks (Low to High)
-    std::map<double, std::vector<long>, std::greater<double>> bids_;
-    std::map<double, std::vector<long>> asks_; // Default is std::less
-    
-    // Core data storage: active orders currently resting in the book
-    std::unordered_map<long, OrderEntry> orders_;
-    
-    // Trade history for this book
-    std::vector<Execution> executions_;
-    long nextExecId_ = 1;
-    
-    // Callback to notify the Engine when an order leaves the book (Filled/Cancelled)
-    using CompletionCallback = std::function<void(long, const std::string&, const OrderEntry&)>;
-    CompletionCallback onComplete_;
-
 public:
-    OrderBook() = default;
+    struct PriceBucket {
+        long totalVolume = 0;
+        std::list<OrderEntry> entries;
+    };
 
-    // We now use the concrete 'Order' type instead of template 'T'
-    void setCallback(CompletionCallback cb);
-    void processOrder(const Order& order);
+    explicit OrderBook(std::string sym);
+
+    void execute(Order& incoming, std::vector<Execution>& globalExecs, std::mutex& execMutex, std::atomic<long>& nextExecId);
+    bool cancelByTag(const std::string& tag);
+    bool cancelById(long orderId);
+    std::optional<OrderEntry> getActiveOrder(long orderId);
+    std::optional<OrderEntry> getActiveOrderByTag(const std::string& tag);
+    OrderBookSnapshot getSnapshot(int depth) const;
+    double getLastPrice() const;
+    void updateLastPrice(double price);
+
+private:
+    std::atomic<double> lastPrice{0.0}; // Initialized to 0.0 for the "Initial State"
+    std::string symbol;
+    mutable std::mutex bookMutex;
+    OrderRegistry registry;
     
-    std::optional<OrderEntry> getOrderDetails(long id) const;
-    std::vector<Execution> flushExecutions();
-    BookTop getTop() const;
+    std::map<double, PriceBucket, std::greater<double>> bids;
+    std::map<double, PriceBucket, std::less<double>> asks;
+
+    // Template definition in header to ensure visibility for instantiation
+    // Results in Static Dispatch, and superior for performance, vs lambda implementation
+    template <typename T>
+    void matchAgainstSide(Order& incoming, T& targets, std::vector<Execution>& localExecs, std::atomic<long>& nextExecId);
 };

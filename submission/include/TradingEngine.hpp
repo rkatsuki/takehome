@@ -1,45 +1,47 @@
 #pragma once
-
 #include <unordered_map>
-#include <memory>
 #include <shared_mutex>
-#include <atomic>
-#include <string>
-#include <iostream>
+#include <array>
+#include <memory>
 
+#include "Type.hpp"
 #include "OrderBook.hpp"
-#include "OrderRegistry.hpp"
 
 class TradingEngine {
-private:
-    // Protects the symbolBooks_ map (adding/removing symbols)
-    mutable std::shared_mutex engineMutex_;
-    
-    // Map of Symbol -> Specific Order Book (Templates removed)
-    std::unordered_map<std::string, std::unique_ptr<OrderBook>> symbolBooks_;
-    
-    OrderRegistry registry_;
-
-    // Helper to get or create a book for a symbol
-    OrderBook& getOrCreateBook(const std::string& symbol);
-
-    // Internal callback handler for when an order is completed/removed from a book
-    void handleOrderCompletion(long id, const std::string& tag, const OrderEntry& state);
-
 public:
-    TradingEngine() = default;
+    TradingEngine();
+    EngineResponse submitOrder(const Order& order);
+    EngineResponse cancelOrderByTag(const std::string& tag, const std::string& symbol);
+    EngineResponse cancelOrderById(long orderId);
+    EngineResponse getOrderBook(const std::string& symbol, int depth = 1);
+    EngineResponse reportExecutions();
 
-    // Core Trading Actions
-    void executeOrder(Order& order);
-    void executeCancelById(long orderId);
-    void executeCancelByTag(const std::string& tag);   
+    // Queries for resting orders only
+    EngineResponse getActiveOrderById(long orderId);
+    EngineResponse getActiveOrderByTag(const std::string& tag, const std::string& symbol);
 
-    // Queries
-    void printOrderStateByTag(const std::string& tag) const;
-    void reportExecutions();
-    void printOrderBookState(const std::string& symbol) const;
+private:
+    struct alignas(64) ResourceMonitor {
+        std::atomic<long> currentGlobalOrderCount{0};
+    };
+    ResourceMonitor monitor;
 
-    // Delete copy/assignment for safety
-    TradingEngine(const TradingEngine&) = delete;
-    TradingEngine& operator=(const TradingEngine&) = delete;
+
+    OrderBook* getBook(const std::string& symbol);
+
+    mutable std::shared_mutex bookshelfMutex;
+    std::unordered_map<std::string, std::unique_ptr<OrderBook>> symbolBooks;
+
+    static constexpr size_t ID_SHARD_COUNT = 16;
+    struct IdShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<long, std::string> mapping;
+    };
+    std::array<IdShard, ID_SHARD_COUNT> idShards;
+
+    std::mutex execHistoryMutex;
+    std::vector<Execution> executionHistory;
+
+    std::atomic<long> nextOrderId{1};
+    std::atomic<long> nextExecId{1};
 };

@@ -8,10 +8,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Hardened Flags - Standardizing optimization and warnings
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -O3")
+# Optimization flags
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 
-# --- CRITICAL: Ensure binary location matches Kraken script expectations ---
+# Ensure binary location matches Kraken script
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 find_package(Threads REQUIRED)
@@ -20,7 +21,6 @@ set(HEADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Core Logic Library 
-# Including headers here ensures VS Code tracks changes accurately
 file(GLOB HEADERS "${HEADER_DIR}/*.hpp")
 add_library(trading_engine_core STATIC
     ${SOURCE_DIR}/OrderBook.cpp
@@ -31,14 +31,17 @@ add_library(trading_engine_core STATIC
 target_include_directories(trading_engine_core PUBLIC ${HEADER_DIR})
 target_link_libraries(trading_engine_core PRIVATE Threads::Threads)
 
-# Official Binary Target
+# Binary Target
 add_executable(kraken_submission ${SOURCE_DIR}/main.cpp)
 target_link_libraries(kraken_submission PRIVATE trading_engine_core)
 
 # Private Unit Test Target
 find_package(GTest QUIET)
 if(GTest_FOUND)
-    enable_testing() # Essential for standard C++ test discovery
+    # Provides gtest_discover_tests
+    include(GoogleTest) 
+    enable_testing() 
+    
     file(GLOB TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
     
     if(TEST_SOURCES)
@@ -49,5 +52,10 @@ if(GTest_FOUND)
                 GTest::gtest_main 
                 Threads::Threads
         )
+
+        # Automatically register every individual TEST() in your .cpp files, and let CTest see them individually.
+        gtest_discover_tests(unit_tests)
     endif()
 endif()
+
+

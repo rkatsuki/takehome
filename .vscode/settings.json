@@ -1,4 +1,5 @@
 {
     "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+    "cmake.sourceDirectory": "/Users/ryosukekatsuki/git_workspace/takehome/submission",
     // "C_Cpp.intelliSenseEngine": "disabled"
 }

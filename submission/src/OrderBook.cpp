@@ -1,120 +1,179 @@
 #include "OrderBook.hpp"
 
-void OrderBook::setCallback(CompletionCallback cb) {
-    onComplete_ = std::move(cb); 
-}
+OrderBook::OrderBook(std::string sym) : symbol(std::move(sym)) {}
 
-void OrderBook::processOrder(const Order& order) {
-    std::unique_lock lock(bookMutex_);
+void OrderBook::execute(Order& incoming, std::vector<Execution>& globalExecs, std::mutex& execMutex, std::atomic<long>& nextExecId) {
+    std::lock_guard<std::mutex> lock(bookMutex);
+    std::vector<Execution> localExecs;
 
-    // 1. Handle Cancellation
-    if (order.type == OrderType::CANCEL) {
-        auto it = orders_.find(order.orderID);
-        if (it != orders_.end()) {
-            if (onComplete_) onComplete_(order.orderID, it->second.tag, it->second);
-            
-            // Handle different map types separately to avoid ternary operator errors
-            if (it->second.side == Side::BUY) {
-                auto& vec = bids_[it->second.price];
-                vec.erase(std::remove(vec.begin(), vec.end(), order.orderID), vec.end());
-                if (vec.empty()) bids_.erase(it->second.price);
-            } else {
-                auto& vec = asks_[it->second.price];
-                vec.erase(std::remove(vec.begin(), vec.end(), order.orderID), vec.end());
-                if (vec.empty()) asks_.erase(it->second.price);
-            }
-            orders_.erase(it);
-        }
-        return;
+    // 1. MATCHING PHASE
+    // Branching here allows the template to instantiate for the specific map type
+    if (incoming.side == Side::BUY) {
+        matchAgainstSide(incoming, asks, localExecs, nextExecId);
+    } else {
+        matchAgainstSide(incoming, bids, localExecs, nextExecId);
     }
 
-    // 2. Matching Logic Helper (Lambda)
-    // We use a lambda to handle the two different map types (bids_ vs asks_)
-    long remQty = order.quantity;
+    // 2. RESTING PHASE
+    if (incoming.quantity > 0 && incoming.type == OrderType::LIMIT) {
+        if (incoming.side == Side::BUY) {
+            auto& bucket = bids[incoming.price];
+            bucket.totalVolume += incoming.quantity;
+            bucket.entries.push_back({incoming.price, incoming.quantity, incoming.quantity, incoming.side, incoming.tag, incoming.orderID});
+            
+            OrderRegistry::Location loc{incoming.side, incoming.price, std::prev(bucket.entries.end())};
+            registry.record(incoming.orderID, incoming.tag, loc);
+        } else {
+            auto& bucket = asks[incoming.price];
+            bucket.totalVolume += incoming.quantity;
+            bucket.entries.push_back({incoming.price, incoming.quantity, incoming.quantity, incoming.side, incoming.tag, incoming.orderID});
+            
+            OrderRegistry::Location loc{incoming.side, incoming.price, std::prev(bucket.entries.end())};
+            registry.record(incoming.orderID, incoming.tag, loc);
+        }
+    }
+
+    // 3. GLOBAL SYNC
+    if (!localExecs.empty()) {
+        std::lock_guard<std::mutex> gLock(execMutex);
+        globalExecs.insert(globalExecs.end(), 
+                           std::make_move_iterator(localExecs.begin()), 
+                           std::make_move_iterator(localExecs.end()));
+    }
+}
+
+bool OrderBook::cancelByTag(const std::string& tag) {
+    // Registry lookup for tag is thread-safe within OrderRegistry
+    auto locOpt = registry.getLocationByTag(tag);
+    if (!locOpt) return false;
+
+    // Delegate to the surgical ID-based cancellation
+    return cancelById(locOpt->it->orderID);
+}
+
+bool OrderBook::cancelById(long orderId) {
+    std::lock_guard<std::mutex> lock(bookMutex);
+    auto locOpt = registry.getLocation(orderId);
+    if (!locOpt) return false;
+
+    auto& loc = *locOpt;
     
-    auto matchAgainst = [&](auto& oppSideMap) {
-        while (remQty > 0 && !oppSideMap.empty()) {
-            auto it = oppSideMap.begin(); // Best price
-            
-            // Price protection for Limit Orders
-            if (order.type == OrderType::LIMIT) {
-                if (order.side == Side::BUY && it->first > order.price) break;
-                if (order.side == Side::SELL && it->first < order.price) break;
-            }
+    // The Generic Lambda
+    auto cleaner = [&](auto& sideMap) -> bool {
+        auto it = sideMap.find(loc.price);
+        if (it == sideMap.end()) return false;
+        
+        it->second.totalVolume -= loc.it->remainingQuantity;
+        std::string tagToCleanup = loc.it->tag;
+        sideMap[loc.price].entries.erase(loc.it); 
+        
+        if (it->second.entries.empty()) sideMap.erase(it);
+        registry.remove(orderId, tagToCleanup);
+        return true;
+    };
 
-            auto& queue = it->second;
-            auto qIt = queue.begin();
-            
-            while (remQty > 0 && qIt != queue.end()) {
-                long restingId = *qIt;
-                auto& restingOrder = orders_[restingId];
-                
-                long tradeQty = std::min(remQty, restingOrder.remainingQuantity);
-                
-                // Record Execution (ExecID is tracked per book)
-                executions_.push_back({nextExecId_++, order.orderID, restingId, it->first, tradeQty});
-                
-                remQty -= tradeQty;
-                restingOrder.remainingQuantity -= tradeQty;
+    return (loc.side == Side::BUY) ? cleaner(bids) : cleaner(asks);
+}
 
-                if (restingOrder.remainingQuantity == 0) {
-                    if (onComplete_) onComplete_(restingId, restingOrder.tag, restingOrder);
-                    orders_.erase(restingId);
-                    qIt = queue.erase(qIt); 
-                } else {
-                    // Resting order still has qty, so aggressor must be empty
-                    break; 
-                }
-            }
-            if (queue.empty()) oppSideMap.erase(it);
+OrderBookSnapshot OrderBook::getSnapshot(int depth) const {
+    std::lock_guard<std::mutex> lock(bookMutex);
+    OrderBookSnapshot snap;
+    snap.symbol = symbol;
+    
+    auto collect = [&](auto const& mapSource, std::vector<PriceLevel>& vecDest) {
+        int count = 0;
+        for (auto const& [price, bucket] : mapSource) {
+            if (count++ >= depth) break;
+            vecDest.push_back({price, bucket.totalVolume});
         }
     };
 
-    // Execute matching based on side
-    if (order.side == Side::BUY) {
-        matchAgainst(asks_);
-    } else {
-        matchAgainst(bids_);
-    }
+    collect(bids, snap.bids);
+    collect(asks, snap.asks);
+    return snap;
+}
 
-    // 3. Post-Match: Add remainder to book or notify completion
-    if (remQty > 0 && order.type == OrderType::LIMIT) {
-        orders_[order.orderID] = {order.price, remQty, order.quantity, order.side, order.tag};
-        if (order.side == Side::BUY) {
-            bids_[order.price].push_back(order.orderID);
+std::optional<OrderEntry> OrderBook::getActiveOrder(long orderId) {
+    std::lock_guard<std::mutex> lock(bookMutex);
+    
+    auto locOpt = registry.getLocation(orderId);
+    if (!locOpt) return std::nullopt;
+
+    return *(locOpt->it);
+}
+
+std::optional<OrderEntry> OrderBook::getActiveOrderByTag(const std::string& tag) {
+    std::lock_guard<std::mutex> lock(bookMutex);
+    
+    auto locOpt = registry.getLocationByTag(tag);
+    if (!locOpt) return std::nullopt;
+
+    return *(locOpt->it);
+}
+
+template <typename T>
+void OrderBook::matchAgainstSide(Order& incoming, T& targets, std::vector<Execution>& localExecs, std::atomic<long>& nextExecId) {
+    while (incoming.quantity > 0 && !targets.empty()) {
+        auto it = targets.begin(); 
+        const double restingPrice = it->first;
+
+        // Inclusive Price Check (Fixed: Buy >= Sell match)
+        if (incoming.type == OrderType::LIMIT) {
+            if (incoming.side == Side::BUY && restingPrice > incoming.price) break; 
+            if (incoming.side == Side::SELL && restingPrice < incoming.price) break;
+        }
+
+        auto& bucket = it->second;
+        for (auto entryIt = bucket.entries.begin(); entryIt != bucket.entries.end(); ) {
+            if (incoming.quantity <= 0) break;
+
+            auto& resting = *entryIt;
+            long matchQty = std::min(incoming.quantity, resting.remainingQuantity);
+
+            this->updateLastPrice(restingPrice);
+            
+            Execution e;
+            e.executionID = nextExecId.fetch_add(1);
+            e.aggressorOrderID = incoming.orderID;
+            e.restingOrderID = resting.orderID;
+            e.symbol = this->symbol;
+            e.price = restingPrice; 
+            e.quantity = matchQty;
+
+            if (incoming.side == Side::BUY) {
+                e.buyTag = incoming.tag; e.sellTag = resting.tag;
+            } else {
+                e.buyTag = resting.tag; e.sellTag = incoming.tag;
+            }
+            localExecs.push_back(std::move(e));
+
+            incoming.quantity -= matchQty;
+            resting.remainingQuantity -= matchQty;
+            bucket.totalVolume -= matchQty;
+
+            if (resting.remainingQuantity == 0) {
+                registry.remove(resting.orderID, resting.tag);
+                entryIt = bucket.entries.erase(entryIt);
+            } else {
+                ++entryIt;
+            }
+        }
+
+        if (bucket.entries.empty()) {
+            targets.erase(it);
         } else {
-            asks_[order.price].push_back(order.orderID);
-        }
-    } else if (remQty == 0 || order.type == OrderType::MARKET) {
-        if (onComplete_) {
-            OrderEntry finalState{order.price, remQty, order.quantity, order.side, order.tag};
-            onComplete_(order.orderID, order.tag, finalState);
+            break; 
         }
     }
 }
 
-std::optional<OrderEntry> OrderBook::getOrderDetails(long id) const {
-    std::shared_lock lock(bookMutex_);
-    auto it = orders_.find(id);
-    if (it != orders_.end()) return it->second;
-    return std::nullopt;
+template void OrderBook::matchAgainstSide(Order&, std::map<double, OrderBook::PriceBucket, std::less<double>>&, std::vector<Execution>&, std::atomic<long>&);
+template void OrderBook::matchAgainstSide(Order&, std::map<double, OrderBook::PriceBucket, std::greater<double>>&, std::vector<Execution>&, std::atomic<long>&);
+
+double OrderBook::getLastPrice() const {
+    return lastPrice.load(std::memory_order_relaxed);
 }
 
-std::vector<Execution> OrderBook::flushExecutions() {
-    std::unique_lock lock(bookMutex_);
-    return std::move(executions_); // std::move clears the source automatically
-}
-
-BookTop OrderBook::getTop() const {
-    std::shared_lock lock(bookMutex_);
-    BookTop top;
-    if (!bids_.empty()) {
-        top.bestBid = bids_.begin()->first;
-        top.bidLevels = bids_.size();
-    }
-    if (!asks_.empty()) {
-        top.bestAsk = asks_.begin()->first;
-        top.askLevels = asks_.size();
-    }
-    return top;
+void OrderBook::updateLastPrice(double price) {
+    lastPrice.store(price, std::memory_order_relaxed);
 }
