@@ -3,6 +3,7 @@
 #include <string>
 #include <variant>
 #include <optional>
+#include <cstdint>
 #include "Constants.hpp"
 
 // ====================================================================
@@ -15,25 +16,20 @@ enum class OrderType : char { LIMIT = 'L', MARKET = 'M', CANCEL = 'C' };
 // Order Entities
 // ====================================================================
 
-// The raw input from the user/network
 struct Order {
-    long orderID;        // Internal unique ID
-    std::string tag;     // User-provided string ID
+    long orderID;        
+    std::string tag;     
     std::string symbol;
     Side side;
     OrderType type;
+    double quantity;          // The original quantity requested
     double price;
-    long quantity;
-};
 
-// Represents an order sitting inside the OrderBook's internal lists
-struct OrderEntry {
-    double price;
-    long remainingQuantity;
-    long originalQuantity;
-    Side side;
-    std::string tag;
-    long orderID;
+    double remainingQuantity; // Current unfilled quantity (used by OrderBook)
+    int64_t timestamp; // Nanoseconds since epoch
+
+    // Helper for unit tests and registry
+    bool isFilled() const { return remainingQuantity < Precision::EPSILON; }
 };
 
 // ====================================================================
@@ -43,7 +39,7 @@ struct OrderEntry {
 // A single price level for the getOrderBook method
 struct PriceLevel {
     double price;
-    long size;
+    double size;
 };
 
 // The structured response for getOrderBook(symbol, depth)
@@ -51,18 +47,46 @@ struct OrderBookSnapshot {
     std::string symbol;
     std::vector<PriceLevel> bids;
     std::vector<PriceLevel> asks;
+    double lastPrice;
+    int64_t timestamp;     // nanoseconds
 };
 
-// A trade execution (was getOrderBook in your snippet)
+// A trade execution (was getOrderBook in snippet)
 struct Execution {
     long executionID;
     long aggressorOrderID;
     long restingOrderID;
+    
+    // Helps with "Side" clarity
+    Side aggressorSide; 
+    
     std::string symbol;
     double price;
-    long quantity;
+    double quantity;
+    
     std::string buyTag;
     std::string sellTag;
+    
+    int64_t timestamp; // Nanoseconds since epoch
+};
+
+// ====================================================================
+// Order Requests / User Intents
+// ====================================================================
+
+struct MarketOrderRequest {
+    std::string tag;
+    std::string symbol;
+    Side side;
+    double quantity;
+};
+
+struct LimitOrderRequest {
+    std::string tag;
+    std::string symbol;
+    Side side;
+    double quantity;
+    double price;
 };
 
 // ====================================================================
@@ -84,7 +108,7 @@ struct EngineResponse {
         OrderAcknowledgement,
         OrderBookSnapshot, 
         std::vector<Execution>, 
-        OrderEntry
+        Order
     > data;
 
     bool isSuccess() const { return statusCode == 0; }

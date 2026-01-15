@@ -10,7 +10,7 @@ public:
     struct Location {
         Side side;
         double price;
-        std::list<OrderEntry>::iterator it;
+        std::list<Order>::iterator it;
     };
 
     // record mapping for both ID and Tag

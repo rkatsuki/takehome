@@ -58,18 +58,18 @@ void processLine(const string& line, TradingEngine& engine) {
     
     if (cmd == "ORDER") {
         string tag, symbol, sideStr, typeStr, qtyStr, priceStr;
-        getline(ss, tag, ','); getline(ss, symbol, ',');
-        getline(ss, sideStr, ','); getline(ss, typeStr, ',');
-        getline(ss, qtyStr, ','); getline(ss, priceStr, ',');
-        Order ord{
-            .tag = tag,
-            .symbol = symbol,
-            .side = (sideStr == "BUY" || sideStr == "B") ? Side::BUY : Side::SELL,
-            .type = (typeStr == "MARKET" || typeStr == "M") ? OrderType::MARKET : OrderType::LIMIT,
-            .price = priceStr.empty() ? 0.0 : stod(priceStr),
-            .quantity = stol(qtyStr)
-        };
-        presentResponse(engine.submitOrder(ord));
+        getline(ss, tag, ','); 
+        getline(ss, symbol, ',');
+        getline(ss, sideStr, ','); 
+        Side side = (sideStr == "BUY" || sideStr == "B") ? Side::BUY : Side::SELL;
+        getline(ss, typeStr, ',');
+        getline(ss, qtyStr, ',');
+        if (typeStr == "MARKET" || typeStr == "M"){
+            presentResponse(engine.submitOrder(MarketOrderRequest{tag, symbol, side, stod(qtyStr)}));            
+        } else {
+            getline(ss, priceStr);
+            presentResponse(engine.submitOrder(LimitOrderRequest{tag, symbol, side, stod(qtyStr), stod(priceStr)}));
+        }
     } 
     else if (cmd == "CANCEL_TAG") {
         string tag, symbol;
@@ -89,7 +89,7 @@ void processLine(const string& line, TradingEngine& engine) {
         presentResponse(engine.getOrderBook(symbol, depth));
     } 
     else if (cmd == "FLUSH") {
-        presentResponse(engine.reportExecutions());
+        presentResponse(engine.getExecutions());
     }
 }
 

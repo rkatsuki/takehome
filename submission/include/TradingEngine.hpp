@@ -3,6 +3,8 @@
 #include <shared_mutex>
 #include <array>
 #include <memory>
+#include <chrono>
+#include <cstdint>
 
 #include "Type.hpp"
 #include "OrderBook.hpp"
@@ -10,23 +12,26 @@
 class TradingEngine {
 public:
     TradingEngine();
-    EngineResponse submitOrder(const Order& order);
+    EngineResponse submitOrder(const LimitOrderRequest& req);
+    EngineResponse submitOrder(const MarketOrderRequest& req);
     EngineResponse cancelOrderByTag(const std::string& tag, const std::string& symbol);
     EngineResponse cancelOrderById(long orderId);
     EngineResponse getOrderBook(const std::string& symbol, int depth = 1);
-    EngineResponse reportExecutions();
-
+    EngineResponse getExecutions();
     // Queries for resting orders only
     EngineResponse getActiveOrderById(long orderId);
     EngineResponse getActiveOrderByTag(const std::string& tag, const std::string& symbol);
 
 private:
+    int64_t now();
     struct alignas(64) ResourceMonitor {
         std::atomic<long> currentGlobalOrderCount{0};
     };
     ResourceMonitor monitor;
 
-
+    Order transform(const LimitOrderRequest& req);
+    Order transform(const MarketOrderRequest& req);
+    EngineResponse matchAndRecord(Order& order);
     OrderBook* getBook(const std::string& symbol);
 
     mutable std::shared_mutex bookshelfMutex;
