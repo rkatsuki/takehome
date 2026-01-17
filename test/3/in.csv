@@ -1,30 +1,6 @@
-# Order 1: sell limit order for 5 MSFT shares at $101 per share.
-ORDER,1,MSFT,SELL,LIMIT,5,101
-# Order 2: sell limit order for 5 MSFT shares at $102 per share.
-ORDER,2,MSFT,SELL,LIMIT,5,102
-# Order 3: sell limit order for 5 MSFT shares at $103 per share.
-ORDER,3,MSFT,SELL,LIMIT,5,103
-# Order 4: sell limit order for 5 MSFT shares at $104 per share.
-ORDER,4,MSFT,SELL,LIMIT,5,104
-# Order 5: sell limit order for 5 MSFT shares at $105 per share.
-ORDER,5,MSFT,SELL,LIMIT,5,105
-# Orderbook: the top of orderbook should have - total of 5 ordres; ask at 101 and no bid.
-ORDERBOOK,MSFT
-# Order 6: buy limit order for 5 MSFT shares at $96 per share.
-ORDER,6,MSFT,BUY,LIMIT,5,96
-# Order 7: buy limit order for 5 MSFT shares at $97 per share.
-ORDER,7,MSFT,BUY,LIMIT,5,97
-# Order 8: buy limit order for 5 MSFT shares at $98 per share.
-ORDER,8,MSFT,BUY,LIMIT,5,98
-# Order 9: buy limit order for 5 MSFT shares at $99 per share.
-ORDER,9,MSFT,BUY,LIMIT,5,99
-# Order 10: buy limit order for 5 MSFT shares at $100 per share.
-ORDER,10,MSFT,BUY,LIMIT,5,100
-# Orderbook: the top of orderbook should have - total of 10 ordres; ask at 101 and bid at 100
-ORDERBOOK,MSFT
-# Order 11: buy limit order for 1 MSFT shares at $101 per share.
-ORDER,11,MSFT,BUY,LIMIT,1,101
-# Execution: order 11 is fully filled and order 1 is partially filled. Requestor 11 buys 1 MSFT at $101 per share from requestor 1.
-EXECUTION
-# Orderbook: the top of orderbook should have - total of 10 ordres; ask at 101 and bid at 100
-ORDERBOOK,MSFT
+N, 1, VAL, 10, 100, B, 1
+N, 2, VAL, 9, 100, B, 101
+N, 2, VAL, 11, 100, S, 102
+N, 1, VAL, 11, 100, B, 2
+N, 2, VAL, 11, 100, S, 103
+F
