@@ -1,52 +1,71 @@
 #pragma once
+
 #include <unordered_map>
-#include <shared_mutex>
-#include <array>
 #include <memory>
-#include <chrono>
-#include <cstdint>
+#include <shared_mutex>
+#include <string>
+#include <atomic>
+#include <optional>
 
 #include "Type.hpp"
 #include "OrderBook.hpp"
 
+/**
+ * @brief The TradingEngine: The Central Hub of the Matching System.
+ */
 class TradingEngine {
 public:
     TradingEngine();
+
+    // --- Order Ingress (Public API) ---
     EngineResponse submitOrder(const LimitOrderRequest& req);
     EngineResponse submitOrder(const MarketOrderRequest& req);
-    EngineResponse cancelOrderByTag(const std::string& tag, const std::string& symbol);
-    EngineResponse cancelOrderById(long orderId);
-    EngineResponse getOrderBook(const std::string& symbol, int depth = 1);
-    EngineResponse getExecutions();
-    // Queries for resting orders only
-    EngineResponse getActiveOrderById(long orderId);
-    EngineResponse getActiveOrderByTag(const std::string& tag, const std::string& symbol);
+
+    // --- Query & Control (Public API) ---
+    // Updated: Uses OrderID (uint64_t)
+    EngineResponse getOrder(OrderID id);
+    EngineResponse getOrderByTag(const std::string& tag);
+    
+    // Updated: Uses Symbol struct
+    EngineResponse getOrderBookSnapshot(const Symbol& symbol, size_t depth);
+    
+    // Updated: Uses OrderID (uint64_t)
+    EngineResponse cancelOrder(OrderID id);
+    EngineResponse cancelOrderByTag(const std::string& tag);
 
 private:
-    int64_t now();
-    struct alignas(64) ResourceMonitor {
-        std::atomic<long> currentGlobalOrderCount{0};
-    };
-    ResourceMonitor monitor;
+    // --- Internal Logic Pipeline ---
+    
+    // Updated: Uses Symbol and OrderID types
+    EngineResponse validateCommon(const Symbol& symbol, double quantity, 
+                                 std::optional<double> price, const std::string& tag);
 
-    Order transform(const LimitOrderRequest& req);
-    Order transform(const MarketOrderRequest& req);
-    EngineResponse matchAndRecord(Order& order);
-    OrderBook* getBook(const std::string& symbol);
+    EngineResponse processOrder(std::shared_ptr<Order> order);
 
-    mutable std::shared_mutex bookshelfMutex;
-    std::unordered_map<std::string, std::unique_ptr<OrderBook>> symbolBooks;
+    EngineResponse finalizeExecution(const MatchResult& result, std::shared_ptr<Order> taker);
 
-    static constexpr size_t ID_SHARD_COUNT = 16;
-    struct IdShard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<long, std::string> mapping;
-    };
-    std::array<IdShard, ID_SHARD_COUNT> idShards;
+    EngineResponse internalCancel(OrderID orderId);
 
-    std::mutex execHistoryMutex;
-    std::vector<Execution> executionHistory;
+    // --- Venue Management ---
+    
+    // Updated: Uses Symbol struct
+    OrderBook* getOrAddBook(const Symbol& sym);
+    OrderBook* tryGetBook(const Symbol& sym) const;
 
-    std::atomic<long> nextOrderId{1};
-    std::atomic<long> nextExecId{1};
+    // --- Data Members ---
+
+    // The Registry: Global map of all active and finished orders.
+    // Updated: Keyed by OrderID (uint64_t)
+    std::unordered_map<OrderID, std::shared_ptr<Order>> idRegistry;
+    std::unordered_map<std::string, OrderID> tagToId;
+    mutable std::shared_mutex registryMutex; 
+
+    // The Bookshelf: Manages the collection of OrderBooks.
+    // Updated: Keyed by Symbol struct (leveraging your custom std::hash<Symbol>)
+    std::unordered_map<Symbol, std::unique_ptr<OrderBook>> symbolBooks;
+    mutable std::shared_mutex bookshelfMutex; 
+
+    // Global counters for the system
+    // Updated: Uses ExecID (uint64_t)
+    std::atomic<ExecID> nextExecId{1000000}; 
 };

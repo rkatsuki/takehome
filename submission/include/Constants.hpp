@@ -1,4 +1,5 @@
 #pragma once
+
 #include <set>
 #include <string>
 
@@ -7,6 +8,7 @@
 // ====================================================================
 namespace Config {
     // 1. Traded Symbols
+    inline constexpr int SYMBOL_LENGTH = 12; // Standardized length for all symbols
     const std::vector<std::string> TRADED_SYMBOLS = {
         "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "DOT/USD",
         "AVAX/USD", "MATIC/USD", "LINK/USD", "UNI/USD", "LTC/USD"
@@ -42,14 +44,16 @@ namespace Precision {
         double result = target - subtrahend;
         target = (result < EPSILON) ? 0.0 : result;
     }
-
     /**
      * Checks if two doubles are effectively equal within epsilon.
      */
     inline bool equal(double a, double b) {
         return std::abs(a - b) < EPSILON;
     }
-
+    // Check if a value is a real, tradable amount
+    inline bool isPositive(double value) {
+        return value >= EPSILON;
+    }
     inline bool isZero(double val) {
         return std::abs(val) < EPSILON;
     }

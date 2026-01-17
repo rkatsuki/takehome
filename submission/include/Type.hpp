@@ -1,115 +1,183 @@
 #pragma once
-#include <vector>
+
 #include <string>
-#include <variant>
+#include <vector>
+#include <list>
+#include <memory>
+#include <shared_mutex>
+#include <atomic>
+#include <chrono>
 #include <optional>
 #include <cstdint>
+#include <compare>
+#include <cstring>
+
 #include "Constants.hpp"
 
-// ====================================================================
-// Core Enums
-// ====================================================================
-enum class Side : char { BUY = 'B', SELL = 'S' };
-enum class OrderType : char { LIMIT = 'L', MARKET = 'M', CANCEL = 'C' };
+// --- ID Types ---
+using OrderID = uint64_t;
+using ExecID  = uint64_t;
+using SeqNum  = uint64_t;
 
-// ====================================================================
-// Order Entities
-// ====================================================================
+// --- The Symbol Struct ---
+// --- The "Zero-Copy" Symbol Struct ---
+struct Symbol {
+    char data[Config::SYMBOL_LENGTH] = {0};
 
-struct Order {
-    long orderID;        
-    std::string tag;     
-    std::string symbol;
-    Side side;
-    OrderType type;
-    double quantity;          // The original quantity requested
-    double price;
+    explicit Symbol(std::string_view n) {
+        size_t len = std::min(n.size(), sizeof(data) - 1);
+        std::memcpy(data, n.data(), len);
+    }
+    Symbol() = default;
 
-    double remainingQuantity; // Current unfilled quantity (used by OrderBook)
-    int64_t timestamp; // Nanoseconds since epoch
+    auto operator<=>(const Symbol& other) const = default;
 
-    // Helper for unit tests and registry
-    bool isFilled() const { return remainingQuantity < Precision::EPSILON; }
+    const char* c_str() const { return data; }
+    // Updated empty check for the array
+    bool empty() const { return data[0] == '\0'; }
+    // Added for convenience in shell/printing
+    std::string name() const { return std::string(data); }
 };
 
-// ====================================================================
-// Engine Outputs (Snapshots & Trades)
-// ====================================================================
+// enable Symbol as hash key: hash specialization for the char array
+namespace std {
+    template<>
+    struct hash<Symbol> {
+        size_t operator()(const Symbol& s) const {
+            // Hash the raw 12 bytes as a string_view
+            return std::hash<std::string_view>{}(std::string_view(s.data, Config::SYMBOL_LENGTH));
+        }
+    };
+}
 
-// A single price level for the getOrderBook method
+// --- Enums & Basic Constants ---
+enum class Side { BUY, SELL };
+enum class OrderType { LIMIT, MARKET };
+enum class OrderStatus { ACTIVE, FILLED, CANCELLED };
+
+enum class EngineStatusCode {
+    OK = 0,
+    VALIDATION_FAILURE    = 400, // Updated to 400 for your Firewall Tests
+    ORDER_ID_NOT_FOUND    = 102,
+    SYMBOL_NOT_FOUND      = 103,
+    TAG_NOT_FOUND         = 104,
+    DUPLICATE_TAG         = 105,
+    PRICE_OUT_OF_BAND     = 106,
+    ALREADY_TERMINAL      = 107
+};
+
+// --- 1. OrderBook Internals ---
+struct Order; 
+
+struct OrderEntry {
+    double remainingQuantity;
+    std::shared_ptr<Order> fatOrder; 
+};
+
 struct PriceLevel {
     double price;
-    double size;
+    double totalVolume = 0.0;
+    std::list<OrderEntry> entries; 
 };
 
-// The structured response for getOrderBook(symbol, depth)
+struct OrderLocation {
+    std::list<OrderEntry>::iterator it; // Iterator into the list is still stable
+    double price;                       // Store the price to find the level later
+    Side side;
+};
+
+// --- 2. The Order (The "Fat" Source of Truth) ---
+struct Order {
+    static inline std::atomic<OrderID> globalCounter{1000};
+    
+    // UPDATED: Standardized types
+    const OrderID orderID = globalCounter.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count();
+
+    double price;
+    double originalQuantity;
+    double remainingQuantity; 
+    double cumulativeCost = 0.0; 
+
+    Side side;
+    OrderType type;
+    OrderStatus status = OrderStatus::ACTIVE;
+    
+    Symbol symbol;   
+    std::string tag;   
+
+    mutable std::shared_mutex stateMutex; 
+
+    Order(double p, double oQ, double rQ, double cC, Side s, 
+          OrderType t, OrderStatus st, Symbol sym, std::string tg)
+        : price(p), originalQuantity(oQ), remainingQuantity(rQ), 
+          cumulativeCost(cC), side(s), type(t), status(st), 
+          symbol(std::move(sym)), tag(std::move(tg)) {}
+
+    Order(const Order&) = delete;
+    Order& operator=(const Order&) = delete;
+
+    auto operator<=>(const Order& other) const { return orderID <=> other.orderID; }
+    bool operator==(const Order& other) const { return orderID == other.orderID; }
+
+    [[nodiscard]] bool isFinished() const {
+        std::shared_lock lock(stateMutex);
+        return status != OrderStatus::ACTIVE;
+    }
+};
+
+// --- 3. Snapshot & Messaging Types ---
+
+struct BookLevel {
+    double price;
+    double quantity;
+};
+
 struct OrderBookSnapshot {
-    std::string symbol;
-    std::vector<PriceLevel> bids;
-    std::vector<PriceLevel> asks;
-    double lastPrice;
-    int64_t timestamp;     // nanoseconds
+    Symbol symbol;
+    std::vector<BookLevel> bids;
+    std::vector<BookLevel> asks;
+    SeqNum updateSeq = 0; // ADDED: For versioning
 };
 
-// A trade execution (was getOrderBook in snippet)
-struct Execution {
-    long executionID;
-    long aggressorOrderID;
-    long restingOrderID;
-    
-    // Helps with "Side" clarity
-    Side aggressorSide; 
-    
-    std::string symbol;
+struct ShadowBuffer {
+    std::vector<BookLevel> bids;
+    std::vector<BookLevel> asks;
+    SeqNum sequence = 0;   // ADDED: For versioning
+};
+
+struct FillRecord {
+    ExecID executionId;    // UPDATED
     double price;
     double quantity;
-    
-    std::string buyTag;
-    std::string sellTag;
-    
-    int64_t timestamp; // Nanoseconds since epoch
+    OrderID takerOrderId;  // UPDATED
+    OrderID makerOrderId;  // UPDATED
 };
 
-// ====================================================================
-// Order Requests / User Intents
-// ====================================================================
-
-struct MarketOrderRequest {
-    std::string tag;
-    std::string symbol;
-    Side side;
-    double quantity;
+struct MatchResult {
+    OrderID takerOrderId;  // UPDATED
+    double remainingQuantity;
+    std::vector<FillRecord> fills;
 };
 
-struct LimitOrderRequest {
-    std::string tag;
-    std::string symbol;
-    Side side;
-    double quantity;
-    double price;
-};
-
-// ====================================================================
-// Response Wrapper
-// ====================================================================
-
-struct OrderAcknowledgement {
-    long orderID;
-    std::string tag;
-};
+// --- 4. Engine Communication ---
 
 struct EngineResponse {
-    int statusCode; // 0: Success, 1+: Error
+    EngineStatusCode code;
     std::string message;
-    
-    // Using std::monostate for "void" success responses
-    std::variant<
-        std::monostate,
-        OrderAcknowledgement,
-        OrderBookSnapshot, 
-        std::vector<Execution>, 
-        Order
-    > data;
+    std::shared_ptr<Order> order = nullptr;
+    std::optional<OrderBookSnapshot> snapshot = std::nullopt;
 
-    bool isSuccess() const { return statusCode == 0; }
+    static EngineResponse Success(std::string msg, std::shared_ptr<Order> o = nullptr) {
+        return { EngineStatusCode::OK, std::move(msg), std::move(o) };
+    }
+    static EngineResponse Error(EngineStatusCode c, std::string msg) {
+        return { c, std::move(msg), nullptr };
+    }
+    
+    bool isSuccess() const { return code == EngineStatusCode::OK; }
 };
+
+struct LimitOrderRequest { double price; double quantity; Side side; Symbol symbol; std::string tag; };
+struct MarketOrderRequest { double quantity; Side side; Symbol symbol; std::string tag; };

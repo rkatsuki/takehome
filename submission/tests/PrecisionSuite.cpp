@@ -8,7 +8,7 @@ protected:
 
 // This tests if ten small fills correctly add up to a whole, or if they leave a microscopic remainder that keeps a price level "alive."
 TEST_F(PrecisionSuite, AccumulatedDustCleanup) {
-    std::string symbol = "BTC/USD";
+    Symbol symbol = "BTC/USD";
     double targetPrice = 50000.0;
     double buySize = 1.0;
     double sellSize = 0.1000000001;

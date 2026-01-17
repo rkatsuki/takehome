@@ -1,0 +1,72 @@
+ECHO ================================================================
+ECHO TEST SUITE: Trading Engine Core Functional Validation
+ECHO ================================================================
+
+ECHO [SCENARIO 1] Initial Price Discovery & Seed Liquidity
+ECHO Description: Placing a resting bid to establish an initial market.
+LIMIT BUY BTC/USD 1.0 50000.00 MAKER_1
+BOOK BTC/USD 5
+ECHO ----------------------------------------------------------------
+
+ECHO [SCENARIO 2] Price-Time Priority Validation
+ECHO Description: Placing two sell orders at the same price. 
+ECHO SELL_A should be at the front of the queue.
+LIMIT SELL BTC/USD 0.5 50100.00 SELL_A
+LIMIT SELL BTC/USD 0.5 50100.00 SELL_B
+BOOK BTC/USD 5
+ECHO ----------------------------------------------------------------
+
+ECHO [SCENARIO 3] Aggressive Matching (Partial Sweep)
+ECHO Description: Taker buys 0.8 units at 50100.00.
+ECHO This should fully fill SELL_A (0.5) and partially fill SELL_B (0.3).
+LIMIT BUY BTC/USD 0.8 50100.00 TAKER_1
+ECHO ----------------------------------------------------------------
+
+ECHO [SCENARIO 4] Post-Trade State Audit
+ECHO Description: Verifying that statuses and remaining quantities 
+ECHO are correctly updated in the Registry.
+ECHO Expected: TAKER_1 (FILLED), SELL_A (FILLED), SELL_B (ACTIVE, 0.2 rem)
+GET_TAG TAKER_1
+GET_TAG SELL_A
+GET_TAG SELL_B
+ECHO ----------------------------------------------------------------
+
+ECHO [SCENARIO 5] Tag-Based Cancellation
+ECHO Description: Removing the remaining 0.2 units of SELL_B via tag.
+CANCEL_TAG SELL_B
+ECHO Resulting Book (Should be empty at 50100.00):
+BOOK BTC/USD 5
+ECHO ----------------------------------------------------------------
+
+ECHO [SCENARIO 6] Market Order Liquidity Exhaustion
+ECHO Description: Attempting a Market Order when no asks exist.
+MARKET BUY BTC/USD 0.1 MKT_1
+ECHO ----------------------------------------------------------------
+
+ECHO ================================================================
+ECHO [SCENARIO 7] Partial Fill Test
+ECHO Description: Large Sell order (1.0) vs Small Buy order (0.4).
+ECHO ================================================================
+
+ECHO 1. Placing Large Maker Sell Order (1.0 @ 50500.00)
+LIMIT SELL BTC/USD 1.0 50500.00 BIG_SELLER
+
+ECHO 2. Placing Small Taker Buy Order (0.4 @ 50500.00)
+LIMIT BUY BTC/USD 0.4 50500.00 SMALL_TAKER
+
+ECHO 3. Auditing Maker State (BIG_SELLER)
+ECHO Expected: Status ACTIVE (0), Remaining 0.6
+GET_TAG BIG_SELLER
+
+ECHO 4. Auditing Taker State (SMALL_TAKER)
+ECHO Expected: Status FILLED (1), Remaining 0.0
+GET_TAG SMALL_TAKER
+
+ECHO 5. Verifying Book (Should show 0.6 remaining at 50500.00)
+BOOK BTC/USD 5
+ECHO ================================================================
+
+ECHO ================================================================
+ECHO TEST SUITE COMPLETE
+ECHO ================================================================
+QUIT

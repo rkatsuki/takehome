@@ -9,7 +9,7 @@ protected:
 
 // measure the latency of each individual order, store them in a vector, sort them, and then extract the percentiles.
 TEST_F(PerformanceSuite, LatencyPercentileAnalysis) {
-    const std::string sym = "BTC/USD";
+    const Symbol sym = "BTC/USD";
     const int iterations = 50000;
     std::vector<double> latencies;
     latencies.reserve(iterations);
@@ -58,7 +58,7 @@ TEST_F(PerformanceSuite, FullScalingStressTest) {
     const int matchesPerSymbol = 10000;
     const int opsPerSymbol = matchesPerSymbol + 1; // 10k Limit + 1 Market Sweep
     
-    auto workload = [this](std::string sym, int count) {
+    auto workload = [this](Symbol sym, int count) {
         for(int i = 0; i < count; ++i) {
             engine.submitOrder(LimitOrderRequest{"M_" + sym + std::to_string(i), sym, Side::BUY, 1.0, 100.0});
         }
@@ -109,7 +109,7 @@ TEST_F(PerformanceSuite, FullScalingStressTest) {
 
 // intentionally create contention by having one thread try to delete data (Cancel) while another is trying to read and modify it (Match).
 TEST_F(PerformanceSuite, RaceConditionStress) {
-    const std::string sym = "BTC/USD";
+    const Symbol sym = "BTC/USD";
     const int orderCount = 5000;
     const double price = 100.0;
 
@@ -159,7 +159,7 @@ TEST_F(PerformanceSuite, RaceConditionStress) {
 
 // This test fills the book with orders across a wide price range, then measures how long it takes to execute a "Sweep" that must traverse many different memory nodes.
 TEST_F(PerformanceSuite, OrderDensityStress) {
-    const std::string sym = "BTC/USD";
+    const Symbol sym = "BTC/USD";
     const int priceLevels = 1000; // 1,000 distinct price points
     const int ordersPerLevel = 5;  // 5,000 total orders
     

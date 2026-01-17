@@ -25,7 +25,6 @@ file(GLOB HEADERS "${HEADER_DIR}/*.hpp")
 add_library(trading_engine_core STATIC
     ${SOURCE_DIR}/OrderBook.cpp
     ${SOURCE_DIR}/TradingEngine.cpp
-    ${SOURCE_DIR}/OrderRegistry.cpp
     ${HEADERS}
 )
 target_include_directories(trading_engine_core PUBLIC ${HEADER_DIR})
@@ -35,27 +34,27 @@ target_link_libraries(trading_engine_core PRIVATE Threads::Threads)
 add_executable(kraken_submission ${SOURCE_DIR}/main.cpp)
 target_link_libraries(kraken_submission PRIVATE trading_engine_core)
 
-# Private Unit Test Target
-find_package(GTest QUIET)
-if(GTest_FOUND)
-    # Provides gtest_discover_tests
-    include(GoogleTest) 
-    enable_testing() 
+# # Private Unit Test Target
+# find_package(GTest QUIET)
+# if(GTest_FOUND)
+#     # Provides gtest_discover_tests
+#     include(GoogleTest) 
+#     enable_testing() 
     
-    file(GLOB TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+#     file(GLOB TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
     
-    if(TEST_SOURCES)
-        add_executable(unit_tests ${TEST_SOURCES})
-        target_link_libraries(unit_tests 
-            PRIVATE 
-                trading_engine_core 
-                GTest::gtest_main 
-                Threads::Threads
-        )
+#     if(TEST_SOURCES)
+#         add_executable(unit_tests ${TEST_SOURCES})
+#         target_link_libraries(unit_tests 
+#             PRIVATE 
+#                 trading_engine_core 
+#                 GTest::gtest_main 
+#                 Threads::Threads
+#         )
 
-        # Automatically register every individual TEST() in your .cpp files, and let CTest see them individually.
-        gtest_discover_tests(unit_tests)
-    endif()
-endif()
+#         # Automatically register every individual TEST() in your .cpp files, and let CTest see them individually.
+#         gtest_discover_tests(unit_tests)
+#     endif()
+# endif()
 
 

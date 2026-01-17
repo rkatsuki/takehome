@@ -1,228 +1,209 @@
 #include "TradingEngine.hpp"
 
-// Constructor
-TradingEngine::TradingEngine() 
-    : nextOrderId(1), nextExecId(1) {
-    // Initialization of sharded ID maps or monitors if necessary
-    monitor.currentGlobalOrderCount.store(0);
-}
-
-// Helper to get current epoch in nanoseconds
-int64_t TradingEngine::now() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::high_resolution_clock::now().time_since_epoch()
-    ).count();
-}
+TradingEngine::TradingEngine() : nextExecId(1000000) {}
 
 // ============================================================================
-// TRANSFORMERS: Creating internal Order entities from Requests
+// SECTION 1: ORDER INGRESS (SUBMISSION)
 // ============================================================================
-
-Order TradingEngine::transform(const LimitOrderRequest& req) {
-    // Generate ID later in matchAndRecord to ensure sequence at the point of entry
-    return { 
-        0, req.tag, req.symbol, req.side, OrderType::LIMIT, 
-        req.quantity, req.price, req.quantity, now() 
-    };
-}
-
-Order TradingEngine::transform(const MarketOrderRequest& req) {
-    return { 
-        0, req.tag, req.symbol, req.side, OrderType::MARKET, 
-        req.quantity, 0.0, req.quantity, now() 
-    };
-}
-
-// ============================================================================
-// CORE LOGIC: Order Submission & Matching
-// ============================================================================
-
-// Order Type   Matching Scenario   execs.size()    remQty  Registry?   submitOrder() Result
-// Limit        Full Match          >0,             0.0     No,         Success (0)
-// Limit        Partial Match       >0              >0.0    Yes         Success (0)
-// Limit        No Match            0,              0.0     Yes         Success (0)
-// Market       Partial/Full        >0              ≥0.0    No          Success (0)
-// Market       No Match            0               >0.0    No          Failure (400)
 
 EngineResponse TradingEngine::submitOrder(const LimitOrderRequest& req) {
-    Order order = transform(req);
-    return matchAndRecord(order);
+    auto val = validateCommon(req.symbol, req.quantity, req.price, req.tag); 
+    if (!val.isSuccess()) return val;
+
+    // Use Symbol struct directly
+    auto order = std::make_shared<Order>(
+        req.price, req.quantity, req.quantity, 0.0, 
+        req.side, OrderType::LIMIT, OrderStatus::ACTIVE, 
+        req.symbol, req.tag
+    );
+    return processOrder(order);
 }
 
 EngineResponse TradingEngine::submitOrder(const MarketOrderRequest& req) {
-    Order order = transform(req);
-    return matchAndRecord(order);
+    auto val = validateCommon(req.symbol, req.quantity, std::nullopt, req.tag);
+    if (!val.isSuccess()) return val;
+
+    auto order = std::make_shared<Order>(
+        0.0, req.quantity, req.quantity, 0.0, 
+        req.side, OrderType::MARKET, OrderStatus::ACTIVE, 
+        req.symbol, req.tag
+    );
+    return processOrder(order);
 }
 
-EngineResponse TradingEngine::matchAndRecord(Order& order) {
-    // 1. Symbol Validation
-    if (!Config::isSupported(order.symbol)) {
-        return {400, "Unsupported symbol", std::monostate{}};
+EngineResponse TradingEngine::validateCommon(const Symbol& symbol, double quantity, 
+                                             std::optional<double> price, const std::string& tag) {
+    if (quantity <= 0 || quantity > Config::MAX_ORDER_QTY) {
+        return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Invalid quantity");
     }
 
-    // 2. Quantity Validation (Using Precision::EPSILON)
-    // Prevents orders that are too small to be meaningful (Dust)
-    if (order.quantity < Precision::EPSILON || order.quantity > Config::MAX_ORDER_QTY) {
-        return {400, "Invalid or excessive quantity", std::monostate{}};
+    if (tag.size() > Config::MAX_TAG_SIZE) {
+        return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Tag too long");
     }
 
-    // 3. Tag Length Check
-    if (order.tag.size() > Config::MAX_TAG_SIZE) {
-        return {400, "Tag string exceeds maximum allowed length", std::monostate{}};
+    if (symbol.empty()) {
+        return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Invalid symbol");
     }
 
-    // 4. Global Capacity Check
-    if (monitor.currentGlobalOrderCount.load(std::memory_order_relaxed) >= Config::MAX_GLOBAL_ORDERS) [[unlikely]] {
-        return {503, "Engine at maximum capacity", std::monostate{}};
-    }
-
-    // 5. Price range validation (Limit Orders only)
-    if (order.type == OrderType::LIMIT) {
-        if (order.price < Config::MIN_ORDER_PRICE || order.price > Config::MAX_ORDER_PRICE) {
-            return {400, "Invalid or excessive price", std::monostate{}};
+    {
+        std::shared_lock lock(registryMutex);
+        if (idRegistry.size() >= Config::MAX_GLOBAL_ORDERS) {
+            return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Engine at max capacity");
         }
     }
 
-    OrderBook* book = getBook(order.symbol);
-    if (!book) return {400, "Invalid Symbol", std::monostate{}};
+    if (price.has_value()) {
+        double p = *price;
+        if (p < Config::MIN_ORDER_PRICE || p > Config::MAX_ORDER_PRICE) {
+            return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Price out of range");
+        }
 
-    // 6. Price banding validation
-    double currentLastPrice = book->getLastPrice(); 
-    if (order.type == OrderType::LIMIT && currentLastPrice > Precision::EPSILON) {
-        double diff = std::abs(order.price - currentLastPrice);
-        if (diff > (currentLastPrice * Config::PRICE_BAND_PERCENT)) {
-            return {400, "Price outside banding limits", std::monostate{}};
+        if (OrderBook* book = tryGetBook(symbol)) {
+            if (book->getPriceLevelCount() >= Config::MAX_PRICE_LEVELS) {
+                return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Orderbook too fragmented");
+            }
+
+            double lastPrice = book->getLastPrice();
+            if (lastPrice > 0.0) {
+                double band = lastPrice * Config::PRICE_BAND_PERCENT;
+                if (p > (lastPrice + band) || p < (lastPrice - band)) {
+                    return EngineResponse::Error(EngineStatusCode::PRICE_OUT_OF_BAND, "Price outside banding limits");
+                }
+            }
         }
     }
 
-    // 7. PRE-EXECUTION RECORDING
-    // We assign the ID and map the symbol so the Matcher knows who owns the order
-    order.orderID = nextOrderId.fetch_add(1);
+    return EngineResponse::Success("Validated");
+}
 
-    // 8. EXECUTION PHASE
-    // Capture the size of execution history BEFORE the call to see if matches happen
-    size_t beforeExecCount;
+EngineResponse TradingEngine::processOrder(std::shared_ptr<Order> order) {
     {
-        std::lock_guard<std::mutex> lock(execHistoryMutex);
-        beforeExecCount = executionHistory.size();
-    }
-
-    book->execute(order, executionHistory, execHistoryMutex, nextExecId);
-
-    // 9. POST-EXECUTION VALIDATION (The StateSuite Fix)
-    bool matchedAny = false;
-    {
-        std::lock_guard<std::mutex> lock(execHistoryMutex);
-        matchedAny = (executionHistory.size() > beforeExecCount);
-    }
-
-    // If it's a Market Order and nothing matched, it's a failure.
-    if (order.type == OrderType::MARKET && !matchedAny) {
-        // Clean up the shard mapping since the order is being discarded
-        auto& shard = idShards[order.orderID % ID_SHARD_COUNT];
-        {
-            std::unique_lock lock(shard.mutex);
-            shard.mapping.erase(order.orderID);
+        std::unique_lock lock(registryMutex);
+        if (tagToId.contains(order->tag)) {
+            return EngineResponse::Error(EngineStatusCode::DUPLICATE_TAG, "Tag collision");
         }
-        return {400, "Insufficient liquidity for market order", std::monostate{}};
+        tagToId[order->tag] = order->orderID;
+        idRegistry[order->orderID] = order;
     }
 
-    // 10. FINAL SUCCESS RECORDING
-    auto& shard = idShards[order.orderID % ID_SHARD_COUNT];
-    {
-        std::unique_lock lock(shard.mutex);
-        shard.mapping[order.orderID] = order.symbol;
+    OrderBook* book = getOrAddBook(order->symbol);
+    MatchResult result = book->execute(order, nextExecId);
+    
+    return finalizeExecution(result, order);
+}
+
+EngineResponse TradingEngine::finalizeExecution(const MatchResult& result, std::shared_ptr<Order> taker) {
+    std::string msg;
+    if (taker->status == OrderStatus::FILLED) {
+        msg = "Order fully filled";
+    } else if (result.fills.empty()) {
+        msg = (taker->type == OrderType::MARKET) ? "Market order cancelled (No Liquidity)" : "Order posted to book";
+    } else {
+        msg = "Order partially filled";
     }
 
-    // Increment global monitor only if the order actually persists (is a LIMIT order)
-    // or if we count every submission. Usually, we only count resting orders.
-    if (order.type == OrderType::LIMIT) {
-        monitor.currentGlobalOrderCount.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    return {0, "Success", OrderAcknowledgement{order.orderID, order.tag}};
+    return EngineResponse::Success(std::move(msg), taker);
 }
 
 // ============================================================================
-// RETRIEVAL & MAINTENANCE
+// SECTION 2: MANAGEMENT & INFRASTRUCTURE
 // ============================================================================
 
-OrderBook* TradingEngine::getBook(const std::string& symbol) {
+EngineResponse TradingEngine::internalCancel(OrderID orderId) {
+    auto it = idRegistry.find(orderId);
+    if (it == idRegistry.end()) return EngineResponse::Error(EngineStatusCode::ORDER_ID_NOT_FOUND, "ID missing");
+
+    std::shared_ptr<Order> order = it->second;
+    if (order->isFinished()) return EngineResponse::Error(EngineStatusCode::ALREADY_TERMINAL, "Already terminal");
+
+    if (OrderBook* book = tryGetBook(order->symbol)) {
+        auto cancelledQty = book->cancelById(order->orderID);
+        
+        if (cancelledQty.has_value()) {
+            std::unique_lock lock(order->stateMutex); 
+            order->status = OrderStatus::CANCELLED;
+            order->remainingQuantity = *cancelledQty;
+            return EngineResponse::Success("Cancelled");
+        }
+    }
+    return EngineResponse::Error(EngineStatusCode::ORDER_ID_NOT_FOUND, "Not active in book");
+}
+
+OrderBook* TradingEngine::getOrAddBook(const Symbol& symbol) {
     {
         std::shared_lock lock(bookshelfMutex);
         auto it = symbolBooks.find(symbol);
         if (it != symbolBooks.end()) return it->second.get();
     }
+    std::unique_lock lock(bookshelfMutex);
+    auto& book = symbolBooks[symbol];
+    if (!book) book = std::make_unique<OrderBook>(symbol);
+    return book.get();
+}
 
-    // Lazy initialization of OrderBooks
-    if (Config::isSupported(symbol)) {
-        std::unique_lock lock(bookshelfMutex);
-        if (symbolBooks.find(symbol) == symbolBooks.end()) {
-            symbolBooks[symbol] = std::make_unique<OrderBook>(symbol);
+OrderBook* TradingEngine::tryGetBook(const Symbol& symbol) const {
+    std::shared_lock lock(bookshelfMutex);
+    auto it = symbolBooks.find(symbol);
+    return (it != symbolBooks.end()) ? it->second.get() : nullptr;
+}
+
+// ============================================================================
+// SECTION 3: PUBLIC API WRAPPERS
+// ============================================================================
+
+EngineResponse TradingEngine::getOrder(OrderID id) {
+    std::shared_lock lock(registryMutex);
+    auto it = idRegistry.find(id);
+    if (it == idRegistry.end()) return EngineResponse::Error(EngineStatusCode::ORDER_ID_NOT_FOUND, "ID missing");
+
+    std::shared_ptr<Order> order = it->second;
+    
+    // The Handshake: Check the live book if the order is still active
+    if (!order->isFinished()) {
+        if (OrderBook* book = tryGetBook(order->symbol)) {
+            auto liveQty = book->getRemainingQty(order->orderID);
+            if (liveQty.has_value()) {
+                order->remainingQuantity = *liveQty;
+            }
         }
-        return symbolBooks[symbol].get();
     }
-    return nullptr;
+    
+    return EngineResponse::Success("Success", order);
 }
 
-EngineResponse TradingEngine::cancelOrderByTag(const std::string& tag, const std::string& symbol) {
-    OrderBook* book = getBook(symbol);
-    if (!book) return {404, "Symbol Not Found", std::monostate{}};
-    return book->cancelByTag(tag) ? EngineResponse{0, "Success"} : EngineResponse{1, "Tag Not Found"};
+EngineResponse TradingEngine::cancelOrder(OrderID id) {
+    // Note: Mutex management is handled inside internalCancel and registry logic
+    return internalCancel(id);
 }
 
-EngineResponse TradingEngine::cancelOrderById(long orderId) {
-    auto& shard = idShards[orderId % ID_SHARD_COUNT];
-    std::string symbol;
+EngineResponse TradingEngine::getOrderByTag(const std::string& tag) {
+    OrderID id = 0;
     {
-        std::shared_lock lock(shard.mutex);
-        auto it = shard.mapping.find(orderId);
-        if (it == shard.mapping.end()) return {1, "ID Not Found"};
-        symbol = it->second;
+        std::shared_lock lock(registryMutex);
+        auto it = tagToId.find(tag);
+        if (it == tagToId.end()) return EngineResponse::Error(EngineStatusCode::TAG_NOT_FOUND, "Tag not found");
+        id = it->second;
     }
-
-    OrderBook* book = getBook(symbol);
-    if (book && book->cancelById(orderId)) {
-        std::unique_lock lock(shard.mutex);
-        shard.mapping.erase(orderId);
-        return {0, "Success"};
-    }
-    return {1, "Cancel Failed"};
+    return getOrder(id);
 }
 
-EngineResponse TradingEngine::getOrderBook(const std::string& symbol, int depth) {
-    OrderBook* book = getBook(symbol);
-    return book ? EngineResponse{0, "Success", book->getSnapshot(depth)} : EngineResponse{404, "Invalid Symbol"};
-}
-
-EngineResponse TradingEngine::getExecutions() {
-    std::lock_guard<std::mutex> lock(execHistoryMutex);
-    auto batch = std::move(executionHistory);
-    executionHistory.clear();
-    return {0, "Success", std::move(batch)};
-}
-
-EngineResponse TradingEngine::getActiveOrderById(long orderId) {
-    auto& shard = idShards[orderId % ID_SHARD_COUNT];
-    std::string symbol;
+EngineResponse TradingEngine::cancelOrderByTag(const std::string& tag) {
+    OrderID id = 0;
     {
-        std::shared_lock lock(shard.mutex);
-        auto it = shard.mapping.find(orderId);
-        if (it == shard.mapping.end()) return {1, "Order not found", std::monostate{}};
-        symbol = it->second;
+        std::shared_lock lock(registryMutex);
+        auto it = tagToId.find(tag);
+        if (it == tagToId.end()) return EngineResponse::Error(EngineStatusCode::TAG_NOT_FOUND, "Tag not found");
+        id = it->second;
     }
-
-    OrderBook* book = getBook(symbol);
-    if (!book) return {500, "Internal Error", std::monostate{}};
-
-    auto entryOpt = book->getActiveOrder(orderId);
-    return entryOpt ? EngineResponse{0, "Success", *entryOpt} : EngineResponse{1, "Order no longer active"};
+    return internalCancel(id);
 }
 
-EngineResponse TradingEngine::getActiveOrderByTag(const std::string& tag, const std::string& symbol) {
-    OrderBook* book = getBook(symbol);
-    if (!book) return {404, "Symbol not found", std::monostate{}};
+EngineResponse TradingEngine::getOrderBookSnapshot(const Symbol& symbol, size_t depth) {
+    OrderBook* book = tryGetBook(symbol);
+    if (!book) return EngineResponse::Error(EngineStatusCode::SYMBOL_NOT_FOUND, "Symbol missing");
 
-    auto entryOpt = book->getActiveOrderByTag(tag);
-    return entryOpt ? EngineResponse{0, "Success", *entryOpt} : EngineResponse{1, "Tag not found"};
+    OrderBookSnapshot snap = book->getSnapshot(depth);
+    EngineResponse resp = EngineResponse::Success("Success");
+    resp.snapshot = std::move(snap);
+    return resp;
 }

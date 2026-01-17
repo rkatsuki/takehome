@@ -1,204 +1,181 @@
 #include "OrderBook.hpp"
 
-OrderBook::OrderBook(std::string sym) : symbol(std::move(sym)) {}
-
-// --- RESTORED: CANCELLATION LOGIC ---
-
-bool OrderBook::cancelByTag(const std::string& tag) {
-    // Registry lookup for tag is thread-safe within OrderRegistry
-    auto locOpt = registry.getLocationByTag(tag);
-    if (!locOpt) return false;
-
-    // Delegate to the surgical ID-based cancellation using the ID found
-    return cancelById(locOpt->it->orderID);
+OrderBook::OrderBook(Symbol sym) : symbol(std::move(sym)) {
+    // Reserve memory upfront to avoid mid-trade latency spikes
+    bids.reserve(Config::MAX_PRICE_LEVELS / 2);
+    asks.reserve(Config::MAX_PRICE_LEVELS / 2);
 }
 
-bool OrderBook::cancelById(long orderId) {
-    std::lock_guard<std::mutex> lock(bookMutex);
-    auto locOpt = registry.getLocation(orderId);
-    if (!locOpt) return false;
+void OrderBook::placeOrder(std::shared_ptr<Order> order) {
+    auto& targetSide = (order->side == Side::BUY) ? bids : asks;
 
-    auto& loc = *locOpt;
+    // 1. Binary search for the insertion point
+    // Note: We use raw comparison here for the search logic (std::lower_bound needs it)
+    auto it = std::lower_bound(targetSide.begin(), targetSide.end(), order->price,
+        [&](const PriceLevel& lvl, double p) {
+            if (order->side == Side::BUY) return lvl.price > p; // Bids: High to Low
+            return lvl.price < p; // Asks: Low to High
+        });
+
+    // 2. Check for existence using Precision::equal (The Epsilon Check)
+    // We must check if 'it' is valid AND if the price matches our epsilon
+    bool levelExists = (it != targetSide.end() && Precision::equal(it->price, order->price));
+
+    if (!levelExists) {
+        // Create new level if epsilon check fails
+        it = targetSide.insert(it, PriceLevel{order->price});
+    }
+
+    // 3. Update the Level Volume using Precision-safe addition logic if necessary
+    // (Though simple addition is usually fine, we use totalVolume for snapshots)
+    it->totalVolume += order->remainingQuantity;
+    it->entries.push_back(OrderEntry{order->remainingQuantity, order});
+
+    // 4. Update the Global Index
+    idToLocation[order->orderID] = { 
+        std::prev(it->entries.end()), 
+        order->price, 
+        order->side 
+    };
+}
+
+// Updated: Uses OrderID (uint64_t)
+std::optional<double> OrderBook::getRemainingQty(OrderID id) const {
+    auto itLoc = idToLocation.find(id);
+    if (itLoc == idToLocation.end()) return std::nullopt;
+
+    const auto& [entryIt, price, side] = itLoc->second;
+    const auto& targetSide = (side == Side::BUY) ? bids : asks;
+
+    // Binary search for the price level
+    auto itLevel = std::lower_bound(targetSide.begin(), targetSide.end(), price,
+        [&](const PriceLevel& lvl, double p) {
+            if (side == Side::BUY) return lvl.price > p;
+            return lvl.price < p;
+        });
+
+    if (itLevel != targetSide.end() && Precision::equal(itLevel->price, price)) {
+        // Double check: Does the entry still exist in this level?
+        // Since we store a list iterator, we can access it directly.
+        return entryIt->remainingQuantity;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<double> OrderBook::cancelById(OrderID id) {
+    // 1. O(1) Lookup to find where the order should be
+    auto itLoc = idToLocation.find(id);
+    if (itLoc == idToLocation.end()) return std::nullopt;
+
+    // We retrieve the price and side (stable values) 
+    // and the list iterator (stable for std::list)
+    auto [entryIt, price, side] = itLoc->second;
+    auto& targetSide = (side == Side::BUY) ? bids : asks;
+
+    // 2. Binary search to find the PriceLevel in the vector
+    auto itLevel = std::lower_bound(targetSide.begin(), targetSide.end(), price,
+        [&](const PriceLevel& lvl, double p) {
+            if (side == Side::BUY) return lvl.price > p;
+            return lvl.price < p;
+        });
+
+    // 3. Verify the level matches our price using Precision
+    if (itLevel != targetSide.end() && Precision::equal(itLevel->price, price)) {
+        double removedQty = entryIt->remainingQuantity;
+        
+        Precision::subtract_or_zero(itLevel->totalVolume, removedQty);
+
+        // Remove from the list (This is safe because it's std::list)
+        itLevel->entries.erase(entryIt);
+        
+        // Remove from our global ID map
+        idToLocation.erase(itLoc);
+
+        // 4. Vector Compaction: If the price level is now empty, delete it
+        if (itLevel->entries.empty()) {
+            targetSide.erase(itLevel); 
+            // Note: This shift is O(N), but for 20k levels, it's very fast.
+        }
+        
+        return removedQty;
+    }
+
+    return std::nullopt;
+}
+
+MatchResult OrderBook::execute(std::shared_ptr<Order> taker, std::atomic<ExecID>& nextExecId) {
+    MatchResult result{.takerOrderId = taker->orderID};
+
+    if (taker->side == Side::BUY) matchAgainstBook(asks, taker, result, nextExecId);
+    else matchAgainstBook(bids, taker, result, nextExecId);
+
+    // 1. If there is meaningful quantity left after matching
+    if (Precision::isPositive(taker->remainingQuantity)) {
+        if (taker->type == OrderType::LIMIT) {
+            placeOrder(taker); // Post to book
+        } else {
+            // Market Order ran out of liquidity
+            std::unique_lock lock(taker->stateMutex);
+            taker->status = OrderStatus::CANCELLED;
+            // WE LEAVE remainingQuantity ALONE - as per your correct suggestion.
+            // This allows the user to see exactly what didn't fill.
+        }
+    } 
+    // 2. If the remainder is effectively zero (below Epsilon)
+    else {
+        std::unique_lock lock(taker->stateMutex);
+        taker->status = OrderStatus::FILLED;
+        taker->remainingQuantity = 0.0; // Snap "dust" to absolute zero
+    }
+
+    publishShadow();
+    result.remainingQuantity = taker->remainingQuantity;
+    return result; 
+}
+
+void OrderBook::publishShadow() {
+    // Unique lock: Only one thread (the Matcher) writes to the shadow
+    std::unique_lock lock(shadowMutex);
     
-    // Internal helper to clean the specific map (bids or asks)
-    auto cleaner = [&](auto& sideMap) -> bool {
-        auto it = sideMap.find(loc.price);
-        if (it == sideMap.end()) return false;
-        
-        // Use our Precision helper to avoid "ghost" volume
-        Precision::subtract_or_zero(it->second.totalVolume, loc.it->remainingQuantity);
-        
-        std::string tagToCleanup = loc.it->tag;
-        
-        // Erase from the list (iterator remains valid for this call)
-        it->second.entries.erase(loc.it); 
-        
-        // If the price level is now empty, prune the map
-        if (it->second.entries.empty()) {
-            sideMap.erase(it);
-        }
-        
-        // Remove from the multi-index registry
-        registry.remove(orderId, tagToCleanup);
-        return true;
-    };
+    shadow.sequence++;
+    shadow.bids.clear();
+    shadow.asks.clear();
 
-    return (loc.side == Side::BUY) ? cleaner(bids) : cleaner(asks);
+    // Reserve to prevent reallocations during the sync
+    shadow.bids.reserve(bids.size());
+    shadow.asks.reserve(asks.size());
+
+    // Linear walk through the live vector - highly cache-friendly!
+    // Live 'bids' is already [500, 499, 498...] -> Index 0 is best
+    for (const auto& level : bids) {
+        shadow.bids.push_back({level.price, level.totalVolume});
+    }
+    // Live 'asks' is already [501, 502, 503...] -> Index 0 is best
+    for (const auto& level : asks) {
+        shadow.asks.push_back({level.price, level.totalVolume});
+    }
 }
 
-// --- RESTORED: GETTERS & SNAPSHOTS ---
-
-OrderBookSnapshot OrderBook::getSnapshot(int depth) const {
-    std::lock_guard<std::mutex> lock(bookMutex);
+OrderBookSnapshot OrderBook::getSnapshot(size_t depth) const {
+    // Shared lock: Multiple API threads can snapshot while the Matcher is busy
+    std::shared_lock lock(shadowMutex); 
+    
     OrderBookSnapshot snap;
-    snap.symbol = symbol;
-    snap.lastPrice = this->getLastPrice(); 
-    snap.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                     std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-                         
-    auto collect = [&](auto const& mapSource, std::vector<PriceLevel>& vecDest) {
-        int count = 0;
-        for (auto const& [price, bucket] : mapSource) {
-            if (count++ >= depth) break;
-            // Push the aggregate double volume
-            vecDest.push_back({price, bucket.totalVolume});
+    snap.symbol = this->symbol;
+    snap.updateSeq = shadow.sequence;
+
+    // Helper to extract top 'depth' levels from shadow vectors
+    auto copyTopLevels = [&](const std::vector<BookLevel>& src, std::vector<BookLevel>& dest) {
+        size_t count = std::min(depth, src.size());
+        dest.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            dest.push_back(src[i]);
         }
     };
 
-    collect(bids, snap.bids);
-    collect(asks, snap.asks);
+    copyTopLevels(shadow.bids, snap.bids);
+    copyTopLevels(shadow.asks, snap.asks);
+    
     return snap;
 }
-
-std::optional<Order> OrderBook::getActiveOrder(long orderId) {
-    std::lock_guard<std::mutex> lock(bookMutex);
-    auto locOpt = registry.getLocation(orderId);
-    if (!locOpt) return std::nullopt;
-    return *(locOpt->it);
-}
-
-std::optional<Order> OrderBook::getActiveOrderByTag(const std::string& tag) {
-    std::lock_guard<std::mutex> lock(bookMutex);
-    auto locOpt = registry.getLocationByTag(tag);
-    if (!locOpt) return std::nullopt;
-    return *(locOpt->it);
-}
-
-double OrderBook::getLastPrice() const {
-    return lastPrice.load(std::memory_order_relaxed);
-}
-
-void OrderBook::updateLastPrice(double price) {
-    lastPrice.store(price, std::memory_order_relaxed);
-}
-
-// --- EXISTING: EXECUTE & MATCHING CORE ---
-
-void OrderBook::execute(Order& incoming, std::vector<Execution>& globalExecs, std::mutex& execMutex, std::atomic<long>& nextExecId) {
-    std::lock_guard<std::mutex> lock(bookMutex);
-    std::vector<Execution> localExecs;
-
-    if (incoming.side == Side::BUY) {
-        matchAgainstSide(incoming, asks, localExecs, nextExecId);
-    } else {
-        matchAgainstSide(incoming, bids, localExecs, nextExecId);
-    }
-
-    if (incoming.remainingQuantity > Precision::EPSILON && incoming.type == OrderType::LIMIT) {
-        if (incoming.side == Side::BUY) {
-            auto& bucket = bids[incoming.price];
-            bucket.totalVolume += incoming.remainingQuantity;
-            bucket.entries.push_back(incoming); 
-            OrderRegistry::Location loc{incoming.side, incoming.price, std::prev(bucket.entries.end())};
-            registry.record(incoming.orderID, incoming.tag, loc);
-        } else {
-            auto& bucket = asks[incoming.price];
-            bucket.totalVolume += incoming.remainingQuantity;
-            bucket.entries.push_back(incoming);
-            OrderRegistry::Location loc{incoming.side, incoming.price, std::prev(bucket.entries.end())};
-            registry.record(incoming.orderID, incoming.tag, loc);
-        }
-    }
-
-    if (!localExecs.empty()) {
-        std::lock_guard<std::mutex> gLock(execMutex);
-        globalExecs.insert(globalExecs.end(), 
-                           std::make_move_iterator(localExecs.begin()), 
-                           std::make_move_iterator(localExecs.end()));
-    }
-}
-
-template <typename MapType>
-void OrderBook::matchAgainstSide(Order& incoming, MapType& targets, std::vector<Execution>& localExecs, std::atomic<long>& nextExecId) {
-    auto it = targets.begin();
-    while (it != targets.end() && incoming.remainingQuantity > Precision::EPSILON) {
-        double bestPrice = it->first;
-        bool canMatch = (incoming.type == OrderType::MARKET);
-        if (!canMatch) {
-            if (incoming.side == Side::BUY) {
-                canMatch = (incoming.price > bestPrice) || Precision::equal(incoming.price, bestPrice);
-            } else {
-                canMatch = (incoming.price < bestPrice) || Precision::equal(incoming.price, bestPrice);
-            }
-        }
-
-        if (!canMatch) break; 
-
-        auto& bucket = it->second;
-        auto entryIt = bucket.entries.begin();
-
-        while (entryIt != bucket.entries.end() && incoming.remainingQuantity > Precision::EPSILON) {
-            double matchQty = std::min(incoming.remainingQuantity, entryIt->remainingQuantity);
-            long execId = nextExecId.fetch_add(1);
-            
-            localExecs.push_back(generateExecution(incoming, *entryIt, matchQty, execId, bestPrice));
-            updateLastPrice(bestPrice);
-            
-            Precision::subtract_or_zero(incoming.remainingQuantity, matchQty);
-            Precision::subtract_or_zero(entryIt->remainingQuantity, matchQty);
-            Precision::subtract_or_zero(bucket.totalVolume, matchQty);
-
-            if (entryIt->remainingQuantity == 0.0) {
-                registry.remove(entryIt->orderID, entryIt->tag);
-                entryIt = bucket.entries.erase(entryIt);
-            } else {
-                ++entryIt;
-            }
-        }
-
-        if (bucket.entries.empty()) {
-            it = targets.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-Execution OrderBook::generateExecution(const Order& aggressor, const Order& maker, 
-                                        double qty, long execId, double matchPrice) {
-    Execution e;
-    e.executionID = execId;
-    e.aggressorOrderID = aggressor.orderID;
-    e.restingOrderID = maker.orderID;
-    e.aggressorSide = aggressor.side;
-    e.symbol = maker.symbol;
-    e.price = matchPrice;
-    e.quantity = qty;
-    
-    if (aggressor.side == Side::BUY) {
-        e.buyTag = aggressor.tag;
-        e.sellTag = maker.tag;
-    } else {
-        e.buyTag = maker.tag;
-        e.sellTag = aggressor.tag;
-    }
-    
-    e.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::system_clock::now().time_since_epoch()).count();
-    
-    return e;
-}
-
-// Explicit template instantiations for the two map types
-template void OrderBook::matchAgainstSide(Order&, std::map<double, OrderBook::PriceBucket, std::greater<double>>&, std::vector<Execution>&, std::atomic<long>&);
-template void OrderBook::matchAgainstSide(Order&, std::map<double, OrderBook::PriceBucket, std::less<double>>&, std::vector<Execution>&, std::atomic<long>&);

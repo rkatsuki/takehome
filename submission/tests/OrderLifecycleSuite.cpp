@@ -29,7 +29,7 @@ protected:
 // 1. TAG-BASED PERSISTENCE AFTER PARTIAL FILL
 // ============================================================================
 TEST_F(OrderLifecycleSuite, TagLookupAfterPartialFill) {
-    std::string sym = "BTC/USD";
+    Symbol sym = "BTC/USD";
     std::string makerTag = "MAKER_STAY";
 
     // 1. Submit resting order
@@ -84,7 +84,7 @@ TEST_F(OrderLifecycleSuite, TagPurgeOnCompletion) {
 // 4. COMPREHENSIVE GULP: TAGS + EXECUTIONS + BOOK
 // ============================================================================
 TEST_F(OrderLifecycleSuite, GulpWithDetailedTagValidation) {
-    std::string sym = "BTC/USD";
+    Symbol sym = "BTC/USD";
 
     // Level 1 Sellers
     long s1Id = getSystemOrderId(engine.submitOrder(LimitOrderRequest{"S1_TAG", sym, Side::SELL, 10, 100.0}));
