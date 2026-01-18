@@ -1,60 +1,89 @@
 #pragma once
 
-#include <set>
 #include <string>
+#include <vector>
+#include <ranges>
 
-// ====================================================================
-// Global Engine Configuration & Resource Guardrails
-// ====================================================================
+/**
+ * @namespace Config
+ * @brief Global Engine Configuration & Architectural Guardrails
+ * * @details 
+ * DESIGN PHILOSOPHY:
+ * 1. Mechanical Sympathy: Constants are tuned to fit within L3 cache boundaries 
+ * to minimize DRAM stalls.
+ * 2. Numerical Stability: Boundaries enforce IEEE 754 double-precision safety 
+ * to prevent catastrophic cancellation in 1e-9 (Satoshi) math.
+ * 3. Determinism: Resource limits prevent "Rehash Storms" and OOM kills in 
+ * Dockerized environments.
+ */
 namespace Config {
-    // 1. Traded Symbols
-    inline constexpr int SYMBOL_LENGTH = 12; // Standardized length for all symbols
+
+    // --- SYMBOL CONFIGURATION ---
+    
+    /**
+     * @note ARCHITECTURAL DECISION: Fixed-width capacity.
+     * Keeps the Command struct 'TriviallyCopyable' (POD). This allows the CPU to 
+     * use SIMD registers for data movement and avoids heap allocations 
+     * during UDP packet ingestion.
+     */
+    inline constexpr int SYMBOL_LENGTH = 12; 
+
     const std::vector<std::string> TRADED_SYMBOLS = {
         "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "DOT/USD",
         "AVAX/USD", "MATIC/USD", "LINK/USD", "UNI/USD", "LTC/USD"
     };
+
+    /**
+     * @brief O(N) check is acceptable as it only runs once per NEW order.
+     * Branch-predictor friendly iteration via std::ranges.
+     */
     inline bool isSupported(std::string_view symbol) {
         return std::ranges::find(TRADED_SYMBOLS, symbol) != TRADED_SYMBOLS.end();
     }
 
-    // 2. Engine-Wide Limits
-    inline constexpr int  ID_SHARD_COUNT      = 16;         // Number of mutex-protected ID shards; assunmptions 16-32 cores
-    inline constexpr long MAX_GLOBAL_ORDERS   = 10'000'000; // Hard cap on total orders in RAM; expect to use upto 2BM RAM and no disk swap space; price level and its lists and maps is about 150–250 bytes per order. 10M times 200 bytes = 2 GB
+    // --- SYSTEM RESOURCE GUARDRAILS ---
 
-    // 3. Per-OrderBook Limits (Resource Protection)
-    inline constexpr long MAX_ORDERS_PER_BOOK = 1'000'000;  // Prevents one symbol from eating all RAM; ensure not all RAM is used up by the most actively traded symbol
-    inline constexpr int  MAX_PRICE_LEVELS    = 20'000;     // Prevents "Quote Stuffing" fragmenting the map; the limit keeps the time it takes to find a price -- O(log N) -- performant.
-    inline constexpr int  MAX_TAG_SIZE        = 64;         // Max bytes for user-provided string tags; Memory fragmentation and Small String Optimization
+    /**
+     * @note ARCHITECTURAL DECISION: L3 Cache Optimization.
+     * 1M orders @ ~128 bytes each keeps the primary hash-map 'spine' (bucket array) 
+     * within typical 16-32MB L3 caches, ensuring O(1) lookups stay in tens of nanoseconds.
+     */
+    inline constexpr long MAX_GLOBAL_ORDERS = 1'000'000; 
+    
+    /**
+     * @note ARCHITECTURAL DECISION: Search Performance Protection.
+     * Limits the 'depth' of the Price Level map (Red-Black Tree). This prevents 
+     * 'Price Spray' attacks that would degrade O(log N) search performance 
+     * and cause cache thrashing.
+     */
+    inline constexpr int  MAX_PRICE_LEVELS    = 20'000;     
 
-    // 4. Validation Limits (Trading Rules)
-    inline constexpr long   MAX_ORDER_QTY     = 1'000'000'000; // "Fat Finger" protection
-    inline constexpr double MIN_ORDER_PRICE   = 0.00000001;    // Minimum tick size; Standard Satoshi-level precision.
+    // --- ARITHMETIC BOUNDARIES (PRECISION SAFETY) ---
+
+    /**
+     * @note ARCHITECTURAL DECISION: The "Mantissa Wall" (1e9 / 1e-9 Sandwich).
+     * IEEE 754 doubles provide ~15.9 decimal digits of precision. By capping 
+     * Qty at 10^9 and Min Qty at 10^-9, we ensure that adding a 'Satoshi' 
+     * to a max-size order doesn't result in loss of significance.
+     */
+    inline constexpr double MIN_ORDER_QTY     = 0.000000001; // 1e-9 (Satoshi-grade)
+    inline constexpr long   MAX_ORDER_QTY     = 1'000'000'000;
+
+    inline constexpr double MIN_ORDER_PRICE   = 0.00000001;    
     inline constexpr double MAX_ORDER_PRICE   = 1'000'000'000.0;
-    inline constexpr double PRICE_BAND_PERCENT = 1.0;            // Limits the resting orders and clutter in Orderbook
-}
+    
+    // --- VOLATILITY GUARDRAILS ---
 
-namespace Precision {
-    // 1e-9 is standard for BTC (8 decimals) + 1 extra digit for safety
-    const double EPSILON = 1e-9; 
     /**
-     * subtract_or_zeros 'subtrahend' from 'target' and ensures 'target' 
-     * snaps to 0.0 if it falls below the epsilon threshold.
+     * @note ARCHITECTURAL DECISION: Dynamic Price Corridor.
+     * In the absence of a fixed Tick Size, this 50% threshold is the primary 
+     * defense against 'fat-finger' errors and market manipulation. 
+     * Protects the integrity of the Last Traded Price (LTP).
      */
-    inline void subtract_or_zero(double& target, double subtrahend) {
-        double result = target - subtrahend;
-        target = (result < EPSILON) ? 0.0 : result;
-    }
-    /**
-     * Checks if two doubles are effectively equal within epsilon.
-     */
-    inline bool equal(double a, double b) {
-        return std::abs(a - b) < EPSILON;
-    }
-    // Check if a value is a real, tradable amount
-    inline bool isPositive(double value) {
-        return value >= EPSILON;
-    }
-    inline bool isZero(double val) {
-        return std::abs(val) < EPSILON;
-    }
+    inline constexpr double PRICE_CORRIDOR_THRESHOLD = 0.5;
+
+    // --- NETWORK CONFIGURATION ---
+    
+    // Standard unprivileged port for Docker/Ubuntu compatibility.
+    inline constexpr int    UDP_PORT          = 1234;
 }

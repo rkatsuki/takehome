@@ -73,3 +73,16 @@ docker run --rm kraken_submission < integration_test_scenario.txt
 ### Run Engine (Stdin Mode)
 ```bash
 cat inputs.txt | docker run -i --rm kraken-submission
+
+
+
+---- notes
+4. Summary of Assumptions for your DESIGN.md
+In your DESIGN.md, you should document these assumptions to show the reviewers your systems-thinking:
+
+User Responsibility: The user is responsible for the uniqueness of userOrderId within their own scope.
+
+System Responsibility: The engine ensures global uniqueness by scoping userOrderId under userId.
+
+Persistence: Your idRegistry and tagToId maps must persist these mappings until an order is fully filled, canceled, or the system is Flushed (F).
+

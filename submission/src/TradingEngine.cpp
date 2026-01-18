@@ -1,209 +1,194 @@
 #include "TradingEngine.hpp"
 
-TradingEngine::TradingEngine() : nextExecId(1000000) {}
+#include <iostream>
 
-// ============================================================================
-// SECTION 1: ORDER INGRESS (SUBMISSION)
-// ============================================================================
-
-EngineResponse TradingEngine::submitOrder(const LimitOrderRequest& req) {
-    auto val = validateCommon(req.symbol, req.quantity, req.price, req.tag); 
-    if (!val.isSuccess()) return val;
-
-    // Use Symbol struct directly
-    auto order = std::make_shared<Order>(
-        req.price, req.quantity, req.quantity, 0.0, 
-        req.side, OrderType::LIMIT, OrderStatus::ACTIVE, 
-        req.symbol, req.tag
-    );
-    return processOrder(order);
+/**
+ * @brief Logic Orchestrator
+ * @details The Engine operates on the "Pinned Thread" principle. By ensuring 
+ * only one thread ever calls processCommand(), we remove all internal locking 
+ * requirements (Lock-Free State), maximizing L1/L2 cache efficiency.
+ */
+TradingEngine::TradingEngine(OutputHandler& handler) 
+    : outputHandler_(handler)
+{
+    /**
+     * @note Memory Pre-allocation:
+     * Reserving the registry size at startup prevents "Rehash Storms."
+     * In a live market, a map resize can cause a latency spike of several 
+     * milliseconds, which is unacceptable for HFT.
+     */
+    registry_.reserve(Config::MAX_GLOBAL_ORDERS / 100);
 }
 
-EngineResponse TradingEngine::submitOrder(const MarketOrderRequest& req) {
-    auto val = validateCommon(req.symbol, req.quantity, std::nullopt, req.tag);
-    if (!val.isSuccess()) return val;
-
-    auto order = std::make_shared<Order>(
-        0.0, req.quantity, req.quantity, 0.0, 
-        req.side, OrderType::MARKET, OrderStatus::ACTIVE, 
-        req.symbol, req.tag
-    );
-    return processOrder(order);
-}
-
-EngineResponse TradingEngine::validateCommon(const Symbol& symbol, double quantity, 
-                                             std::optional<double> price, const std::string& tag) {
-    if (quantity <= 0 || quantity > Config::MAX_ORDER_QTY) {
-        return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Invalid quantity");
-    }
-
-    if (tag.size() > Config::MAX_TAG_SIZE) {
-        return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Tag too long");
-    }
-
-    if (symbol.empty()) {
-        return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Invalid symbol");
-    }
-
-    {
-        std::shared_lock lock(registryMutex);
-        if (idRegistry.size() >= Config::MAX_GLOBAL_ORDERS) {
-            return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Engine at max capacity");
-        }
-    }
-
-    if (price.has_value()) {
-        double p = *price;
-        if (p < Config::MIN_ORDER_PRICE || p > Config::MAX_ORDER_PRICE) {
-            return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Price out of range");
-        }
-
-        if (OrderBook* book = tryGetBook(symbol)) {
-            if (book->getPriceLevelCount() >= Config::MAX_PRICE_LEVELS) {
-                return EngineResponse::Error(EngineStatusCode::VALIDATION_FAILURE, "Orderbook too fragmented");
+void TradingEngine::processCommand(Command& cmd) {
+    /**
+     * @note Single-Writer Pattern:
+     * We have zero mutexes here. This thread "owns" the OrderBooks and Registry.
+     * External threads communicate only via the ThreadSafeQueues.
+     */
+    switch (cmd.type) {
+        case CommandType::NEW: [[likely]] {
+            
+            // 1. HARD LIMIT GUARDRAIL
+            // Prevents malicious or buggy clients from exhausting system memory.
+            if (registry_.size() >= static_cast<size_t>(Config::MAX_GLOBAL_ORDERS)) [[unlikely]] {
+                outputHandler_.logError("REJECT: Global order limit reached");
+                return;
             }
 
-            double lastPrice = book->getLastPrice();
-            if (lastPrice > 0.0) {
-                double band = lastPrice * Config::PRICE_BAND_PERCENT;
-                if (p > (lastPrice + band) || p < (lastPrice - band)) {
-                    return EngineResponse::Error(EngineStatusCode::PRICE_OUT_OF_BAND, "Price outside banding limits");
-                }
+            // 2. STATUTORY VALIDATION
+            // Check for negative prices, zero quantity, etc., before touching the book.
+            std::string errorReason;
+            if (!validateOrder(cmd, errorReason)) [[unlikely]] {
+                outputHandler_.logError(std::format("REJECT: User {} Order {} - {}", 
+                                       cmd.userId, cmd.userOrderId, errorReason));
+                return;
             }
+            
+            // 3. BOOK ROUTING
+            // Find the specific symbol book. Complexity: O(log N) for map search.
+            OrderBook& book = getOrCreateBook(cmd.symbol);
+            
+            /** * @note ACKNOWLEDGMENT (Requirement):
+             * We acknowledge immediately. If the match takes time (e.g., a massive 
+             * sweep), the client knows their order was at least accepted.
+             */
+            outputHandler_.printAck(cmd.userId, cmd.userOrderId);
+
+            // 4. CORE EXECUTION
+            // Delegate the Price-Time priority logic to the symbol-specific book.
+            book.execute(cmd, registry_);
+            break;
+        }
+
+        case CommandType::CANCEL: [[likely]] {
+            OrderKey key{cmd.userId, cmd.userOrderId};
+            
+            /**
+             * @note Registry-First Lookup:
+             * We don't know which book the order is in. The Registry tells us 
+             * the Symbol/Price/Side in O(1) time.
+             */
+            auto it = registry_.find(key);
+            
+            if (it != registry_.end()) [[likely]] {
+                OrderBook& book = getOrCreateBook(it->second.symbol);
+                book.cancel(key, registry_);
+            } else [[unlikely]] {
+                outputHandler_.logError(std::format("REJECT_CANCEL: Order {}:{} not found", 
+                                        cmd.userId, cmd.userOrderId));
+            }
+            break;
+        }
+
+        case CommandType::FLUSH: [[unlikely]] {
+            handleFlush();
+            break;
         }
     }
-
-    return EngineResponse::Success("Validated");
 }
 
-EngineResponse TradingEngine::processOrder(std::shared_ptr<Order> order) {
-    {
-        std::unique_lock lock(registryMutex);
-        if (tagToId.contains(order->tag)) {
-            return EngineResponse::Error(EngineStatusCode::DUPLICATE_TAG, "Tag collision");
-        }
-        tagToId[order->tag] = order->orderID;
-        idRegistry[order->orderID] = order;
+/**
+ * @brief Global State Reset
+ * @details Instead of deleting OrderBook objects (which triggers expensive 
+ * deallocations), we clear their internal structures to reuse the memory.
+ */
+void TradingEngine::handleFlush() {
+    for (auto& [symbol, bookPtr] : books_) {
+        bookPtr->clear(); 
     }
-
-    OrderBook* book = getOrAddBook(order->symbol);
-    MatchResult result = book->execute(order, nextExecId);
     
-    return finalizeExecution(result, order);
+    // Clear the registry mapping to allow UserOrderIDs to be reused.
+    registry_.clear();
+    
+    outputHandler_.logError("ENGINE_EVENT: Global state reset (Books pooled).");
 }
 
-EngineResponse TradingEngine::finalizeExecution(const MatchResult& result, std::shared_ptr<Order> taker) {
-    std::string msg;
-    if (taker->status == OrderStatus::FILLED) {
-        msg = "Order fully filled";
-    } else if (result.fills.empty()) {
-        msg = (taker->type == OrderType::MARKET) ? "Market order cancelled (No Liquidity)" : "Order posted to book";
-    } else {
-        msg = "Order partially filled";
+/**
+ * @brief Dynamic Book Discovery
+ * @details If a new symbol appears in the UDP stream, we instantiate a new 
+ * book for it. In a production system, these are often pre-created for 
+ * known tickers to avoid runtime allocation.
+ */
+OrderBook& TradingEngine::getOrCreateBook(Symbol symbol) {
+    auto it = books_.find(symbol);
+    
+    if (it == books_.end()) [[unlikely]] {
+        /**
+         * @note std::unique_ptr:
+         * We use smart pointers to ensure that even if the engine crashes, 
+         * all memory associated with the books is freed by the RAII pattern.
+         */
+        auto [newIt, success] = books_.emplace(symbol, 
+                                std::make_unique<OrderBook>(symbol, outputHandler_));
+        return *(newIt->second);
+    }
+    
+    return *(it->second);
+}
+
+
+
+/**
+ * @brief Validates an incoming command against system and market guardrails.
+ * @details This is the 'Firewall' of the engine. It ensures that no invalid state
+ * can reach the OrderBook, maintaining deterministic behavior.
+ */
+bool TradingEngine::validateOrder(const Command& cmd, std::string& outError) {
+    
+    // 1. Basic Guardrails (Always apply)
+    if (!Config::isSupported(cmd.symbol.data)) [[unlikely]] {
+        outError = "INVALID_SYMBOL";
+        return false;
     }
 
-    return EngineResponse::Success(std::move(msg), taker);
-}
+    if (registry_.size() >= static_cast<size_t>(Config::MAX_GLOBAL_ORDERS)) [[unlikely]] {
+        outError = "SYSTEM_CAPACITY_EXCEEDED";
+        return false;
+    }
 
-// ============================================================================
-// SECTION 2: MANAGEMENT & INFRASTRUCTURE
-// ============================================================================
+    // Quantity is required for both Market and Limit orders
+    if (cmd.quantity < Config::MIN_ORDER_QTY - Precision::EPSILON) [[unlikely]] {
+        outError = "QUANTITY_TOO_LOW";
+        return false;
+    }
 
-EngineResponse TradingEngine::internalCancel(OrderID orderId) {
-    auto it = idRegistry.find(orderId);
-    if (it == idRegistry.end()) return EngineResponse::Error(EngineStatusCode::ORDER_ID_NOT_FOUND, "ID missing");
-
-    std::shared_ptr<Order> order = it->second;
-    if (order->isFinished()) return EngineResponse::Error(EngineStatusCode::ALREADY_TERMINAL, "Already terminal");
-
-    if (OrderBook* book = tryGetBook(order->symbol)) {
-        auto cancelledQty = book->cancelById(order->orderID);
+    /**
+        * @note ARCHITECTURAL DECISION: Market vs Limit Branching
+        * If price is 0.0, it is a Market Order. We skip corridor and 
+        * price-level checks because Market orders do not sit on the book.
+        */
+    if (!Precision::isZero(cmd.price)) {
         
-        if (cancelledQty.has_value()) {
-            std::unique_lock lock(order->stateMutex); 
-            order->status = OrderStatus::CANCELLED;
-            order->remainingQuantity = *cancelledQty;
-            return EngineResponse::Success("Cancelled");
+        // Limit Price Magnitude Check
+        if (cmd.price < Config::MIN_ORDER_PRICE - Precision::EPSILON || 
+            cmd.price > Config::MAX_ORDER_PRICE + Precision::EPSILON) [[unlikely]] {
+            outError = "PRICE_OUT_OF_BOUNDS";
+            return false;
         }
-    }
-    return EngineResponse::Error(EngineStatusCode::ORDER_ID_NOT_FOUND, "Not active in book");
-}
 
-OrderBook* TradingEngine::getOrAddBook(const Symbol& symbol) {
-    {
-        std::shared_lock lock(bookshelfMutex);
-        auto it = symbolBooks.find(symbol);
-        if (it != symbolBooks.end()) return it->second.get();
-    }
-    std::unique_lock lock(bookshelfMutex);
-    auto& book = symbolBooks[symbol];
-    if (!book) book = std::make_unique<OrderBook>(symbol);
-    return book.get();
-}
+        // Fetch book to check Volatility Corridor and Structural Limits
+        auto& book = *books_[cmd.symbol];
+        double ltp = book.getLastTradedPrice();
 
-OrderBook* TradingEngine::tryGetBook(const Symbol& symbol) const {
-    std::shared_lock lock(bookshelfMutex);
-    auto it = symbolBooks.find(symbol);
-    return (it != symbolBooks.end()) ? it->second.get() : nullptr;
-}
+        // Corridor Check (Only if market discovery has happened)
+        if (!Precision::isZero(ltp)) {
+            double lowerBound = ltp * (1.0 - Config::PRICE_CORRIDOR_THRESHOLD);
+            double upperBound = ltp * (1.0 + Config::PRICE_CORRIDOR_THRESHOLD);
 
-// ============================================================================
-// SECTION 3: PUBLIC API WRAPPERS
-// ============================================================================
-
-EngineResponse TradingEngine::getOrder(OrderID id) {
-    std::shared_lock lock(registryMutex);
-    auto it = idRegistry.find(id);
-    if (it == idRegistry.end()) return EngineResponse::Error(EngineStatusCode::ORDER_ID_NOT_FOUND, "ID missing");
-
-    std::shared_ptr<Order> order = it->second;
-    
-    // The Handshake: Check the live book if the order is still active
-    if (!order->isFinished()) {
-        if (OrderBook* book = tryGetBook(order->symbol)) {
-            auto liveQty = book->getRemainingQty(order->orderID);
-            if (liveQty.has_value()) {
-                order->remainingQuantity = *liveQty;
+            if (cmd.price < lowerBound - Precision::EPSILON || 
+                cmd.price > upperBound + Precision::EPSILON) [[unlikely]] {
+                outError = "PRICE_OUTSIDE_VOLATILITY_CORRIDOR";
+                return false;
             }
         }
+
+        // Price Level Capacity Check
+        // Market orders don't create levels, so we only check this for Limit orders.
+        if (book.isFull() && !book.hasLevel(cmd.price)) [[unlikely]] {
+            outError = "MAX_ORDERBOOK_PRICE_LEVELS_REACHED";
+            return false;
+        }
     }
-    
-    return EngineResponse::Success("Success", order);
-}
-
-EngineResponse TradingEngine::cancelOrder(OrderID id) {
-    // Note: Mutex management is handled inside internalCancel and registry logic
-    return internalCancel(id);
-}
-
-EngineResponse TradingEngine::getOrderByTag(const std::string& tag) {
-    OrderID id = 0;
-    {
-        std::shared_lock lock(registryMutex);
-        auto it = tagToId.find(tag);
-        if (it == tagToId.end()) return EngineResponse::Error(EngineStatusCode::TAG_NOT_FOUND, "Tag not found");
-        id = it->second;
-    }
-    return getOrder(id);
-}
-
-EngineResponse TradingEngine::cancelOrderByTag(const std::string& tag) {
-    OrderID id = 0;
-    {
-        std::shared_lock lock(registryMutex);
-        auto it = tagToId.find(tag);
-        if (it == tagToId.end()) return EngineResponse::Error(EngineStatusCode::TAG_NOT_FOUND, "Tag not found");
-        id = it->second;
-    }
-    return internalCancel(id);
-}
-
-EngineResponse TradingEngine::getOrderBookSnapshot(const Symbol& symbol, size_t depth) {
-    OrderBook* book = tryGetBook(symbol);
-    if (!book) return EngineResponse::Error(EngineStatusCode::SYMBOL_NOT_FOUND, "Symbol missing");
-
-    OrderBookSnapshot snap = book->getSnapshot(depth);
-    EngineResponse resp = EngineResponse::Success("Success");
-    resp.snapshot = std::move(snap);
-    return resp;
+    return true; 
 }

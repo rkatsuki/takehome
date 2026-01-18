@@ -1,126 +1,113 @@
 #pragma once
 
 #include <map>
-#include <vector>
-#include <memory>
-#include <shared_mutex>
-#include <string>
-#include <atomic>
-#include <optional>
+#include <list>
 #include <unordered_map>
-#include <mutex>
+#include <vector>
 
-#include "Constants.hpp"
-#include "Type.hpp" 
+#include "Types.hpp"
+#include "OutputHandler.hpp"
 
+/**
+ * @brief High-Performance L3 Order Book
+ * @details Manages Bid/Ask state using price-sorted maps.
+ * Uses cache-friendly alignment for core validation members.
+ */
 class OrderBook {
-public:
-    // Updated: Uses Symbol struct
-    explicit OrderBook(Symbol sym);
-
-    // Updated: nextExecId now uses ExecID (uint64_t)
-    MatchResult execute(std::shared_ptr<Order> taker, std::atomic<ExecID>& nextExecId);
-
-    [[nodiscard]] OrderBookSnapshot getSnapshot(size_t depth) const;
-    
-    // Updated: Takes OrderID (uint64_t)
-    [[nodiscard]] std::optional<double> getRemainingQty(OrderID id) const;
-    
-    // Updated: Takes OrderID (uint64_t)
-    std::optional<double> cancelById(OrderID id);
-
-    double getLastPrice() const { 
-        return lastMatchedPrice.load(std::memory_order_relaxed); 
-    }
-
-    size_t getPriceLevelCount() const {
-        return bids.size() + asks.size();
-    }
-
+    friend class OrderBookTestSuite;
 private:
-    Symbol symbol; // Correctly uses the Symbol struct
-    std::atomic<double> lastMatchedPrice{0.0};
+    /**
+     * @note ARCHITECTURAL DECISION: Data Locality
+     * Placing lastTradedPrice_ and symbol_ at the top ensures they are 
+     * likely on the same cache line as the object pointer, speeding up 
+     * validateOrder() calls in the TradingEngine.
+     */
+    double lastTradedPrice_ = 0.0; 
+    Symbol symbol_;
+    OutputHandler& outputHandler_;
 
-    // LIVE VENUE
-    // Bids: Sorted High -> Low | Asks: Sorted Low -> High
-    std::vector<PriceLevel> bids; 
-    std::vector<PriceLevel> asks;
+    // Bid Map: Sorted High-to-Low (std::greater)
+    std::map<double, PriceLevel, std::greater<double>> bids_;
     
-    // Updated: Keyed by OrderID (uint64_t)
-    std::unordered_map<OrderID, OrderLocation> idToLocation;
+    // Ask Map: Sorted Low-to-High (std::less)
+    std::map<double, PriceLevel, std::less<double>> asks_;
 
-    // Helper to binary search the correct price level
-    auto findLevel(std::vector<PriceLevel>& side, double price, Side orderSide);
+    // Last published BBO states for delta tracking
+    BBO lastBid_{-1.0, 0.0};
+    BBO lastAsk_{-1.0, 0.0};
 
-    // SHADOW BUFFER
-    mutable std::shared_mutex shadowMutex;
-    ShadowBuffer shadow;
+    /**
+     * @brief Publishes BBO updates only if the top-of-book has changed.
+     */
+    void checkAndPublishBBO() noexcept;
 
-    void placeOrder(std::shared_ptr<Order> order);
-    void publishShadow(); 
+    /**
+     * @brief Logic for matching a Taker against Maker liquidity.
+     */
+    template<typename T>
+    void matchAgainstSide(Command& taker, T& makerSide, 
+                          std::unordered_map<OrderKey, OrderLocation>& registry) noexcept;
 
-    // Internal Template - Updated to use ExecID
-    template<typename SideVector>
-    void matchAgainstBook(SideVector& targetSide, std::shared_ptr<Order> taker, 
-                        MatchResult& result, std::atomic<ExecID>& nextExecId) {
+    /**
+     * @brief Logic for resting a residual order on the book.
+     */
+    template<typename T>
+    void restOrderOnBook(T& sideMap, Command& cmd, Side side, 
+                         std::unordered_map<OrderKey, OrderLocation>& registry) noexcept;
 
-        auto it = targetSide.begin();
-        
-        // Use the helper for consistency
-        while (it != targetSide.end() && Precision::isPositive(taker->remainingQuantity)) {
-            double levelPrice = it->price;
+    /**
+     * @brief Logic for removing a specific order node.
+     */
+    template<typename T>
+    void removeFromSide(T& sideMap, const OrderLocation& loc, const OrderKey& key, 
+                        std::unordered_map<OrderKey, OrderLocation>& registry,
+                        std::unordered_map<OrderKey, OrderLocation>::iterator regIt) noexcept;
 
-            if (taker->type == OrderType::LIMIT) {
-                if (taker->side == Side::BUY) {
-                    if (levelPrice > taker->price && !Precision::equal(levelPrice, taker->price)) break;
-                } else {
-                    if (levelPrice < taker->price && !Precision::equal(levelPrice, taker->price)) break;
-                }
-            }
+public:
+    /**
+     * @brief Constructor
+     * @param symbol Fixed-width ticker symbol
+     * @param handler Reference to the shared output tape
+     */
+    OrderBook(Symbol symbol, OutputHandler& handler);
 
-            PriceLevel& level = *it;
-            auto entryIt = level.entries.begin();
+    // Disable copying for performance and ownership clarity
+    OrderBook(const OrderBook&) = delete;
+    OrderBook& operator=(const OrderBook&) = delete;
 
-            while (entryIt != level.entries.end() && Precision::isPositive(taker->remainingQuantity)) {
-                double matchQty = std::min(taker->remainingQuantity, entryIt->remainingQuantity);
-                
-                result.fills.push_back({
-                    nextExecId.fetch_add(1, std::memory_order_relaxed),
-                    levelPrice, matchQty, taker->orderID, entryIt->fatOrder->orderID
-                });
+    /**
+     * @brief Accessor for the dynamic volatility corridor center.
+     * @return The price of the last execution or 0.0 if no trades have occurred.
+     */
+    double getLastTradedPrice() const noexcept { return lastTradedPrice_; }
+    
+    /**
+     * @brief Updates the corridor center after a successful match.
+     */
+    void setLastTradedPrice(double price) noexcept { lastTradedPrice_ = price; }
 
-                {
-                    std::unique_lock lock(entryIt->fatOrder->stateMutex);
-                    // Use subtract_or_zero to prevent drift
-                    Precision::subtract_or_zero(entryIt->remainingQuantity, matchQty);
-                    Precision::subtract_or_zero(entryIt->fatOrder->remainingQuantity, matchQty);
-                    entryIt->fatOrder->cumulativeCost += (matchQty * levelPrice);
-                    
-                    if (Precision::isZero(entryIt->remainingQuantity)) {
-                        entryIt->fatOrder->status = OrderStatus::FILLED;
-                        entryIt->fatOrder->remainingQuantity = 0.0; // Hard zero
-                    }
-                }
+    /**
+     * @brief Main entry point for NEW orders.
+     */
+    void execute(Command& cmd, std::unordered_map<OrderKey, OrderLocation>& registry) noexcept;
 
-                Precision::subtract_or_zero(taker->remainingQuantity, matchQty);
-                taker->cumulativeCost += (matchQty * levelPrice);
-                Precision::subtract_or_zero(level.totalVolume, matchQty);
+    /**
+     * @brief O(1) Cancellation path.
+     */
+    void cancel(const OrderKey& key, std::unordered_map<OrderKey, OrderLocation>& registry) noexcept;
 
-                if (Precision::isZero(entryIt->remainingQuantity)) {
-                    idToLocation.erase(entryIt->fatOrder->orderID);
-                    entryIt = level.entries.erase(entryIt);
-                } else {
-                    ++entryIt;
-                }
-            }
+    /**
+     * @brief Wipes the book state without deallocating the object.
+     */
+    void clear() noexcept;
 
-            lastMatchedPrice.store(levelPrice, std::memory_order_relaxed);
+    /**
+     * @brief Structural check against Config limits.
+     */
+    bool isFull() const noexcept;
 
-            if (level.entries.empty()) {
-                it = targetSide.erase(it);
-            } else {
-                break; 
-            }
-        }
-    }
+    /**
+     * @brief O(log N) price level existence check.
+     */
+    bool hasLevel(double price) const noexcept;
 };
