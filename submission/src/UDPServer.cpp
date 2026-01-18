@@ -1,41 +1,46 @@
 #include "UDPServer.hpp"
-
 #include <iostream>
 #include <unistd.h>
 #include <cstring>
-#include <format>
-
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
 /**
- * @brief Network Entry Point
- * @details We initialize the socket using SOCK_DGRAM (UDP). Unlike TCP, UDP 
- * is connectionless, making it significantly faster for market data feeds 
- * but requiring us to handle message boundaries and potential loss ourselves.
+ * @brief Updated Constructor
+ * @details Receives the shared_ptr to the queue directly. This ensures the 
+ * queue stays alive even if the TradingApp is destroyed.
  */
-UDPServer::UDPServer(int port, MessageCallback callback) 
-    : port_(port), onMessage_(std::move(callback)), sockfd_(-1) {
+UDPServer::UDPServer(std::shared_ptr<ThreadSafeQueue<std::string>> inputQueue) 
+    : inputQueue_(std::move(inputQueue)), 
+      sockfd_(-1),
+      running_(false) {
     
+    // 1. Pull values from Config
+    int port = Config::Network::UDP_PORT;
+    const std::string& ip = Config::Network::SERVER_IP;
+    int rcvbuf = Config::Network::SO_RCVBUF_SIZE;
+
     sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd_ < 0) [[unlikely]] {
         perror("Socket creation failed");
         return;
     }
 
-    /**
-     * @note Socket Options:
-     * A senior engineer would often set SO_RCVBUF here to increase the kernel's
-     * UDP buffer size, preventing drops during sudden market "bursts."
-     */
+    // 2. Hardware/Kernel Tuning
+    setsockopt(sockfd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     int opt = 1;
     setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    // 3. Bind to Address
     sockaddr_in servaddr{};
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY); 
-    servaddr.sin_port = htons(port_);
-
+    servaddr.sin_port = htons(port);
+    
+    if (inet_pton(AF_INET, ip.c_str(), &servaddr.sin_addr) <= 0) {
+        servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
+    
     if (bind(sockfd_, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) [[unlikely]] {
         perror("Bind failed");
         close(sockfd_);
@@ -51,101 +56,51 @@ void UDPServer::start() {
     if (sockfd_ < 0) return;
     running_ = true;
     
-    // Split concerns: One thread to capture packets, one to process them.
-    workerThread_ = std::thread(&UDPServer::workerLoop, this);
+    // Start the receiver thread. We no longer need a workerLoop thread 
+    // because we are pushing directly into the App's inputQueue_.
     receiverThread_ = std::thread(&UDPServer::receiverLoop, this);
     
-    std::cout << "SERVER_START: Listening on UDP port " << port_ << std::endl;
+    std::cout << "SERVER_START: Listening on UDP port " << Config::Network::UDP_PORT << std::endl;
 }
 
-/**
- * @brief Graceful Shutdown Logic
- * @details We use shutdown(SHUT_RD) to unblock the recvfrom() system call. 
- * This ensures the thread can check the 'running_' flag and exit cleanly 
- * rather than hanging forever on an idle socket.
- */
 void UDPServer::stop() {
-    running_ = false;
-    cv_.notify_all(); 
+    bool wasRunning = running_.exchange(false);
+    if (!wasRunning) return;
+
     if (sockfd_ >= 0) {
-        // Force the blocking recvfrom to return 0 or error
+        // Unblock recvfrom immediately
         shutdown(sockfd_, SHUT_RD); 
+    }
+
+    if (receiverThread_.joinable()) {
+        receiverThread_.join();
+    }
+
+    if (sockfd_ >= 0) {
         close(sockfd_);
         sockfd_ = -1;
     }
-    if (receiverThread_.joinable()) receiverThread_.join();
-    if (workerThread_.joinable()) workerThread_.join();
 }
 
 /**
- * @brief The "Fast Path" Receiver
- * @details This thread has ONE job: copy data from the kernel to the app 
- * as fast as possible. We minimize logic here to prevent buffer overflows.
+ * @brief Zero-Copy Optimized Receiver
  */
 void UDPServer::receiverLoop() {
-    // 4KB is standard for UDP MTU safety (most packets are < 1500 bytes)
     char buffer[4096];
     sockaddr_in cliaddr{};
     socklen_t len = sizeof(cliaddr);
 
-    while (running_) [[likely]] {
-        /**
-         * @note RECVFROM (Blocking):
-         * This call yields the CPU until a packet arrives. When it returns, 
-         * we immediately move the data to a thread-safe queue.
-         */
-        ssize_t n = recvfrom(sockfd_, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&cliaddr, &len);
+    while (running_.load()) [[likely]] {
+        ssize_t n = recvfrom(sockfd_, buffer, sizeof(buffer) - 1, 0, 
+                             (struct sockaddr *)&cliaddr, &len);
         
         if (n > 0) [[likely]] {
-            buffer[n] = '\0';
-            
-            /**
-             * @note Critical Section:
-             * We wrap the packet in a std::string and push it. 
-             * In the next optimization phase, we would replace this with a 
-             * RingBuffer of pre-allocated char arrays to avoid the 'new' call 
-             * inside std::string.
-             */
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-                queue_.push(std::string(buffer));
-            }
-            cv_.notify_one();
-        } else if (n < 0 && running_) {
-            // Log networking errors to the diagnostic channel
-            // In a production environment, we might track 'packets dropped' stats here.
-        }
-    }
-}
-
-/**
- * @brief The Deserialization Worker
- * @details This thread bridges the raw network bytes and the Trading Engine. 
- * By separating this, a heavy parsing job won't stop the 'receiverLoop' 
- * from picking up the next UDP packet.
- */
-void UDPServer::workerLoop() {
-    while (running_) [[likely]] {
-        std::string msg;
-        {
-            /**
-             * @note Thread Orchestration:
-             * unique_lock + condition_variable ensures this thread consumes 
-             * 0% CPU while the market is quiet.
-             */
-            std::unique_lock<std::mutex> lock(mtx_);
-            cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
-            
-            if (!running_ && queue_.empty()) break;
-            
-            // Move semantics ensure we aren't copying the packet string again.
-            msg = std::move(queue_.front());
-            queue_.pop();
-        }
-        
-        // Pass to the CSVParser/TradingEngine callback
-        if (!msg.empty() && onMessage_) [[likely]] {
-            onMessage_(msg);
+            // Directly push to the App's thread-safe queue.
+            // Since inputQueue_ is a shared_ptr, this is always safe.
+            inputQueue_->push(std::string(buffer, n));
+        } else if (n < 0 && running_.load()) {
+            // Interrupted or timeout
+            continue;
         }
     }
 }

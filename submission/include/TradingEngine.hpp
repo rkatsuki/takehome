@@ -6,6 +6,7 @@
 #include "OrderBook.hpp"
 
 class TradingEngine {
+    friend class TradingApp;
 public:
     explicit TradingEngine(OutputHandler& handler);
 
@@ -15,6 +16,9 @@ public:
     TradingEngine& operator=(const TradingEngine&) = delete;
 
     void processCommand(Command& cmd);
+    // Logic for the 'F' command
+    void handleFlush();
+
 private:
     // Reference to the handler that pushes to the Output Queue
     OutputHandler& outputHandler_;
@@ -26,9 +30,6 @@ private:
 
     OrderBook& getOrCreateBook(Symbol symbol);
     
-    // Logic for the 'F' command
-    void handleFlush();
-
     bool canAcceptNewOrder() const;
     bool validateOrder(const Command& cmd, std::string& outError);
 };

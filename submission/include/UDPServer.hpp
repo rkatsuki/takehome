@@ -4,37 +4,27 @@
 #include <thread>
 #include <atomic>
 #include <functional>
-#include <netinet/in.h>
 #include <vector>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
 
+#include "Constants.hpp"
+#include "ThreadSafeQueue.hpp"
+
 class UDPServer {
 public:
-    // The callback takes the raw string received from the wire
-    using MessageCallback = std::function<void(const std::string&)>;
-
-    UDPServer(int port, MessageCallback callback);
+    explicit UDPServer(std::shared_ptr<ThreadSafeQueue<std::string>> inputQueue);
     ~UDPServer();
-
     void start();
     void stop();
 
 private:
     void receiverLoop();
-    void workerLoop();
 
-    int port_;
+    std::shared_ptr<ThreadSafeQueue<std::string>> inputQueue_;
     int sockfd_;
-    MessageCallback onMessage_;
-    
-    std::atomic<bool> running_{false};
+    int port_;
+    std::atomic<bool> running_;
     std::thread receiverThread_;
-    std::thread workerThread_;
-
-    // Producer-Consumer Queue to prevent dropping UDP packets
-    std::queue<std::string> queue_;
-    std::mutex mtx_;
-    std::condition_variable cv_;
 };

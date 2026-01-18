@@ -167,11 +167,12 @@ bool TradingEngine::validateOrder(const Command& cmd, std::string& outError) {
             return false;
         }
 
-        // Fetch book to check Volatility Corridor and Structural Limits
-        auto& book = *books_[cmd.symbol];
+        /**
+         * @logic FIX: Skip corridor if LTP is 0.0 (No trades yet)
+         * This allows the first trade of the day to set the "anchor" price.
+         */
+        OrderBook& book = getOrCreateBook(cmd.symbol); 
         double ltp = book.getLastTradedPrice();
-
-        // Corridor Check (Only if market discovery has happened)
         if (!Precision::isZero(ltp)) {
             double lowerBound = ltp * (1.0 - Config::PRICE_CORRIDOR_THRESHOLD);
             double upperBound = ltp * (1.0 + Config::PRICE_CORRIDOR_THRESHOLD);

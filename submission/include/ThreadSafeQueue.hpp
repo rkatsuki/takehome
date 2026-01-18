@@ -109,8 +109,22 @@ public:
         cv_.notify_all();
     }
 
+    /**
+    * @brief Non-blocking pop. 
+    * @return Value if available, std::nullopt otherwise. 
+    * Does NOT wait on condition variable.
+    */
+    std::optional<T> try_pop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return std::nullopt;
+        
+        T value = std::move(queue_.front());
+        queue_.pop();
+        return value;
+    }
+
     bool empty() const {
        std::lock_guard<std::mutex> lock(mutex_);
     return queue_.empty();
-}
+    }
 };

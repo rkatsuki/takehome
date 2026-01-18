@@ -83,7 +83,12 @@ namespace Config {
     inline constexpr double PRICE_CORRIDOR_THRESHOLD = 0.5;
 
     // --- NETWORK CONFIGURATION ---
-    
-    // Standard unprivileged port for Docker/Ubuntu compatibility.
-    inline constexpr int    UDP_PORT          = 1234;
+    struct Network {
+        static inline const std::string SERVER_IP = "127.0.0.1"; 
+        static inline constexpr int UDP_PORT = 12345;
+        
+        // 8MB kernel buffer to survive market data bursts
+        static inline constexpr int SO_RCVBUF_SIZE = 8 * 1024 * 1024; 
+        static inline constexpr size_t MAX_PACKET_SIZE = 4096;
+    };    
 }

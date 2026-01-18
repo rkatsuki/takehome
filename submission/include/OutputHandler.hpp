@@ -7,6 +7,16 @@
 
 #include "ThreadSafeQueue.hpp"
 
+// EXPECTED OUTPUT 
+// **Order acknowledgement:**
+// A, userId, userOrderId
+// **Cancel acknowledgement:**
+// C, userId, userOrderId
+// **Trade (matched orders):**
+// T, userIdBuy, userOrderIdBuy, userIdSell, userOrderIdSell, price, quantity
+// **Top of Order / BBO
+// B, side (B or S), price, totalQuantity
+
 /**
  * @brief Output Category
  * @details Separating Data from Errors allows the OutputThread to route
@@ -71,48 +81,36 @@ private:
         queue_->push(std::move(env));
     }
 
-public:
-    explicit OutputHandler(std::shared_ptr<ThreadSafeQueue<OutputEnvelope>> queue) : queue_(std::move(queue)) {}
+    public:
+        explicit OutputHandler(std::shared_ptr<ThreadSafeQueue<OutputEnvelope>> queue) : queue_(std::move(queue)) {}
 
-    // --- CSV Outputs (The Execution Hot Path) ---
+        // --- CSV Outputs (The Execution Hot Path) ---
 
-    /**
-     * @brief Acknowledgment (A)
-     * @details Sent immediately upon order receipt.
-     */
+    // Hot-Path Output Methods
     void printAck(int uId, int uOid) noexcept {
+        // Exact match: A, 1, 101
         enqueue(MsgType::Data, "A, {}, {}\n", uId, uOid);
     }
 
-    /**
-     * @brief Trade Execution (T)
-     * @details Generated during the matching loop. 
-     * Uses {:.6f} to ensure Kraken-standard price/qty precision.
-     */
-    void printTrade(int bId, int bOid, int sId, int sOid, double p, double q) noexcept {
-        enqueue(MsgType::Data, "T, {}, {}, {}, {}, {:.6f}, {:.6f}\n", bId, bOid, sId, sOid, p, q);
-    }
-
-    /**
-     * @brief Best Bid/Offer (B)
-     * @details Published when the top of the book changes.
-     */
-    void printBBO(char side, double p, double q) noexcept {
-        // BRANCH HINT: In active markets, volume (q) is almost always > 0.
-        if (q <= 0) [[unlikely]] {
-            enqueue(MsgType::Data, "B, {}, -, -\n", side);
-        } else [[likely]] {
-            enqueue(MsgType::Data, "B, {}, {:.6f}, {:.6f}\n", side, p, q);
-        }
-    }
-    
-    /**
-     * @brief Cancel Confirmation (C)
-     */
     void printCancel(int uId, int uOid) noexcept {
+        // Exact match: C, 1, 101
         enqueue(MsgType::Data, "C, {}, {}\n", uId, uOid);
     }
 
+    void printTrade(int bId, int bOid, int sId, int sOid, double p, double q) noexcept {
+        // Exact match: T, 1, 3, 2, 102, 11, 100
+        // {:g} handles significant decimals automatically.
+        enqueue(MsgType::Data, "T, {}, {}, {}, {}, {:g}, {:g}\n", bId, bOid, sId, sOid, p, q);
+    }
+
+    void printBBO(char side, double p, double q) noexcept {
+        // Exact match: B, B, 10, 100  OR  B, S, -, -
+        if (q <= 1e-9) [[unlikely]] {
+            enqueue(MsgType::Data, "B, {}, -, -\n", side);
+        } else [[likely]] {
+            enqueue(MsgType::Data, "B, {}, {:g}, {:g}\n", side, p, q);
+        }
+    }
     // --- Diagnostics (The Cold Path) ---
 
     /**

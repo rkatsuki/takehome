@@ -9,10 +9,12 @@
 #include "UDPServer.hpp"
 
 class TradingApp {
+    friend class TradingAppE2ESuite;
 public:
     TradingApp();
+    ~TradingApp();
     void run();
-
+    void flushState();
 private:
     // Foundation: Queues must exist first
     std::shared_ptr<ThreadSafeQueue<OutputEnvelope>> outputQueue_;

@@ -21,23 +21,21 @@ void signalHandler(int signal) {
 TradingApp::TradingApp() 
     : outputQueue_(std::make_shared<ThreadSafeQueue<OutputEnvelope>>()),
       inputQueue_(std::make_shared<ThreadSafeQueue<std::string>>()),
-      // 1. Initialize the handler with the queue
       outputHandler_(outputQueue_), 
-      // 2. Pass the SAME handler to both the engine and parser
       engine_(outputHandler_),
-      parser_(outputHandler_), 
-      server_(nullptr)
-    {
-    /**
-     * @note The Network Callback:
-     * This lambda is the bridge between the UDP thread and the Processing thread.
-     * It performs a simple 'push', keeping the network thread unblocked.
-     */
-    server_ = std::make_unique<UDPServer>(Config::UDP_PORT, [this](const std::string& raw) {
-        inputQueue_->push(raw);
-    });
+      parser_(outputHandler_)
+{
+    server_ = std::make_unique<UDPServer>(inputQueue_);
 
-    std::cerr << "APP_INIT: 3-Pillar Architecture Wired (Input -> Logic -> Output)." << std::endl;
+    std::cerr << "APP_INIT: 3-Pillar Architecture Wired." << std::endl;
+}
+
+TradingApp::~TradingApp() {
+    keepRunning = false; // Signal threads to stop
+    
+    // Join threads BEFORE the members (queues/handlers) are destroyed
+    if (processingThread_.joinable()) processingThread_.join();
+    // server_ unique_ptr will handle its own thread join if designed correctly
 }
 
 /**
@@ -98,8 +96,6 @@ void TradingApp::run() {
      */
     server_->start();
     
-    std::cerr << "SYSTEM_READY: Processing trades on port " << Config::UDP_PORT << std::endl;
-
     // Main thread enters a low-power wait state until Ctrl+C
     while (keepRunning) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -128,4 +124,25 @@ void TradingApp::run() {
     }
     
     std::cerr << "SHUTDOWN_COMPLETE: Core Engine halted." << std::endl;
+}
+
+/**
+ * @brief Resets the system state for testing isolation.
+ * @details This clears the order books and maps without restarting threads.
+ */
+void TradingApp::flushState() {
+    engine_.handleFlush(); 
+
+    std::queue<std::string> dummyIn;
+    if (!inputQueue_->empty()) {
+        inputQueue_->pop_all(dummyIn);
+    }
+
+    // NEW: Drain the output queue so tests start with a clean slate
+    std::queue<OutputEnvelope> dummyOut;
+    if (!outputQueue_->empty()) {
+        outputQueue_->pop_all(dummyOut);
+    }
+    // not fuling up outputQueue_ with this message
+    std::cerr << "ENGINE_EVENT: Engine & Queues Purged ---" << std::endl; 
 }
