@@ -1,7 +1,4 @@
-N, 1, IBM, 10, 100, B, 1
-N, 1, IBM, 12, 100, S, 2
-N, 2, IBM, 9, 100, B, 101
-N, 2, IBM, 11, 100, S, 102
-N, 1, IBM, 0, 20, B, 3
-
+N, 1, BTC/USD, 50000, 18446744073709551615, S, 101  # Uint64 Overflow (Max Qty)
+N, 2, BTC/USD, 1.79e308, 10, S, 102                 # Double Overflow (Max Price)
+N, 3, LONG_SYMBOL_NAME_PADDING_BUFFER_OVERFLOW_ATTACK_STRING_VULNERABILITY_X86_64, 50000, 10, S, 103 # 100+ Char Overflow
 F

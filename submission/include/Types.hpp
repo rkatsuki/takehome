@@ -24,6 +24,7 @@ using ExecID      = uint64_t;
 enum class CommandType : uint8_t { NEW, CANCEL, FLUSH };
 enum class Side : char { BUY = 'B', SELL = 'S' };
 enum class OrderStatus : uint8_t { ACTIVE, FILLED, CANCELLED };
+enum class OrderType : uint8_t { LIMIT = 0, MARKET = 1 };
 
 /**
  * @brief Fixed-Width Symbol Struct
@@ -101,13 +102,14 @@ struct OrderKey {
  */
 struct alignas(64) Command {
     CommandType type;      // 1 byte
+    OrderType orderType;   // 1 field
     Symbol symbol;         // 13 bytes
     UserID userId;         // 8 bytes (Updated from int for consistency)
     UserOrderID userOrderId; // 8 bytes (Updated from int for consistency)
     double quantity;       // 8 bytes
     double price;          // 8 bytes
     Side side;             // 1 byte
-    // Total Size: 47 bytes (+ padding to align to 64 bytes).
+    // Total Size: 48 bytes (+ padding to align to 64 bytes).
 };
 
 /**

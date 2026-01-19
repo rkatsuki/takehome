@@ -49,12 +49,6 @@ void TradingEngine::processCommand(Command& cmd) {
             // Find the specific symbol book. Complexity: O(log N) for map search.
             OrderBook& book = getOrCreateBook(cmd.symbol);
             
-            /** * @note ACKNOWLEDGMENT (Requirement):
-             * We acknowledge immediately. If the match takes time (e.g., a massive 
-             * sweep), the client knows their order was at least accepted.
-             */
-            outputHandler_.printAck(cmd.userId, cmd.userOrderId);
-
             // 4. CORE EXECUTION
             // Delegate the Price-Time priority logic to the symbol-specific book.
             book.execute(cmd, registry_);

@@ -17,6 +17,7 @@
  * Dockerized environments.
  */
 namespace Config {
+    inline constexpr bool DEBUG = false;    
 
     // --- SYMBOL CONFIGURATION ---
     
@@ -29,8 +30,10 @@ namespace Config {
     inline constexpr int SYMBOL_LENGTH = 12; 
 
     const std::vector<std::string> TRADED_SYMBOLS = {
-        "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "DOT/USD",
-        "AVAX/USD", "MATIC/USD", "LINK/USD", "UNI/USD", "LTC/USD"
+        "IBM", "APPL", "MSFT", "VAL",
+        "BTC/USD", "BTC/USDT", "BTC/USDC", "ETH/BTC", 
+        "ETH/USD", "ETH/USDT", "ETH/USDC", 
+        "SOL/USD", "ADA/USD", "DOT/USD", "AVAX/USD", "MATIC/USD", "LINK/USD", "UNI/USD", "LTC/USD"
     };
 
     /**
@@ -85,7 +88,7 @@ namespace Config {
     // --- NETWORK CONFIGURATION ---
     struct Network {
         static inline const std::string SERVER_IP = "127.0.0.1"; 
-        static inline constexpr int UDP_PORT = 12345;
+        static inline constexpr int UDP_PORT = 1234;
         
         // 8MB kernel buffer to survive market data bursts
         static inline constexpr int SO_RCVBUF_SIZE = 8 * 1024 * 1024; 

@@ -60,7 +60,7 @@ void UDPServer::start() {
     // because we are pushing directly into the App's inputQueue_.
     receiverThread_ = std::thread(&UDPServer::receiverLoop, this);
     
-    std::cout << "SERVER_START: Listening on UDP port " << Config::Network::UDP_PORT << std::endl;
+    // std::cout << "SERVER_START: Listening on UDP port " << Config::Network::UDP_PORT << std::endl;
 }
 
 void UDPServer::stop() {
@@ -68,10 +68,11 @@ void UDPServer::stop() {
     if (!wasRunning) return;
 
     if (sockfd_ >= 0) {
-        // Unblock recvfrom immediately
-        shutdown(sockfd_, SHUT_RD); 
+        // 1. Use SHUT_RDWR to be absolutely sure the kernel releases the block
+        shutdown(sockfd_, SHUT_RDWR); 
     }
 
+    // 2. The thread should now fall out of recvfrom and exit the loop
     if (receiverThread_.joinable()) {
         receiverThread_.join();
     }
@@ -95,12 +96,15 @@ void UDPServer::receiverLoop() {
                              (struct sockaddr *)&cliaddr, &len);
         
         if (n > 0) [[likely]] {
-            // Directly push to the App's thread-safe queue.
-            // Since inputQueue_ is a shared_ptr, this is always safe.
             inputQueue_->push(std::string(buffer, n));
-        } else if (n < 0 && running_.load()) {
-            // Interrupted or timeout
+        } else if (n < 0) {
+            // If shutdown() was called, n will be -1.
+            // Check if we were told to stop. If so, exit the loop NOW.
+            if (!running_.load()) break; 
+            
+            // Otherwise, it was just a transient error or EINTR
             continue;
         }
     }
+    std::cerr << "UDP_SERVER: Receiver loop exited." << std::endl;
 }

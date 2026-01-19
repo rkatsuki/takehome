@@ -1,8 +1,6 @@
-N, 1, IBM, 10, 100, B, 1
-N, 1, IBM, 12, 100, S, 2
-N, 2, IBM, 9, 100, B, 101
-N, 2, IBM, 11, 100, S, 102
-C, 1, 1
-C, 2, 102
-
+N, 1, BTC/USD, 50000, 10, S, 101             # Valid baseline
+N, 2, BTC,F, 100, 10, B, 1               # CSV Delimiter Injection (Flush trap)
+N, 3, BTC\nTRAP, 100, 10, B, 2           # Newline Injection (Log spoofing)
+N, 4, BTC\0OVERFLOW, 100, 10, B, 3       # Null-byte Injection
+N, 5, BTC\,ETH, 100, 10, B, 4            # Escape character confusion
 F

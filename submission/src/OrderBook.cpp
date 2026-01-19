@@ -1,3 +1,5 @@
+#include <iostream>
+
 #include "OrderBook.hpp"
 
 #include <algorithm>
@@ -20,7 +22,7 @@ OrderBook::OrderBook(Symbol symbol, OutputHandler& handler)
  * consumption before resting the residual.
  */
 void OrderBook::execute(Command& cmd, std::unordered_map<OrderKey, OrderLocation>& registry) noexcept {
-    
+    std::cerr << "[DEBUG] Execute called for ID: " << cmd.userOrderId << " Type: " << (int)cmd.type << std::endl;
     // Requirement: Every order must be acknowledged upon receipt.
     // We do this before matching to minimize Taker-perceived latency.
     if (cmd.type == CommandType::NEW) [[likely]] {
@@ -32,6 +34,7 @@ void OrderBook::execute(Command& cmd, std::unordered_map<OrderKey, OrderLocation
          * BUY matches against ASKS; SELL matches against BIDS.
          */
         if (cmd.side == Side::BUY) [[likely]] {
+            std::cerr << "[DEBUG] Attempting Buy match against " << asks_.size() << " ask levels" << std::endl;
             matchAgainstSide(cmd, asks_, registry);
         } else {
             matchAgainstSide(cmd, bids_, registry);
@@ -166,6 +169,15 @@ void OrderBook::matchAgainstSide(Command& taker, T& makerSide, std::unordered_ma
         auto orderIt = level.orders.begin(); 
 
         while (orderIt != level.orders.end() && Precision::isPositive(taker.quantity)) {
+            // std::cerr << "[DEBUG] Matching Taker " << taker.userOrderId << " against Maker " << orderIt->userOrderId << std::endl;
+
+            // --- SELF-TRADE PREVENTION ---
+            if (taker.userId == orderIt->userId) [[unlikely]] {
+                ++orderIt; // Move to the next maker at this price level
+                continue;
+            }
+            // -----------------------------
+            
             const double tradeQty = std::min(taker.quantity, orderIt->remainingQuantity);
 
             /**

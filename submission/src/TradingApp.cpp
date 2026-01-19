@@ -1,23 +1,15 @@
 #include "TradingApp.hpp"
-
 #include <csignal>
 #include <iostream>
 
 std::atomic<bool> keepRunning{true};
 
-// Internal signal handler for this translation unit
 void signalHandler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
         keepRunning = false;
     }
 }
 
-/**
- * @brief System Constructor (The Wiring Phase)
- * @details We use a "Dependency Injection" pattern here. By passing references 
- * to the OutputHandler, we ensure that the Parser and Engine can communicate 
- * back to the user without knowing the details of the ThreadSafeQueue.
- */
 TradingApp::TradingApp() 
     : outputQueue_(std::make_shared<ThreadSafeQueue<OutputEnvelope>>()),
       inputQueue_(std::make_shared<ThreadSafeQueue<std::string>>()),
@@ -26,123 +18,101 @@ TradingApp::TradingApp()
       parser_(outputHandler_)
 {
     server_ = std::make_unique<UDPServer>(inputQueue_);
-
-    std::cerr << "APP_INIT: 3-Pillar Architecture Wired." << std::endl;
 }
 
 TradingApp::~TradingApp() {
-    keepRunning = false; // Signal threads to stop
-    
-    // Join threads BEFORE the members (queues/handlers) are destroyed
-    if (processingThread_.joinable()) processingThread_.join();
-    // server_ unique_ptr will handle its own thread join if designed correctly
+    stop(); 
 }
 
-/**
- * @brief The Main Execution Loop
- * @details Orchestrates the lifecycle of the three primary execution pillars.
- */
+void TradingApp::stop() {
+    keepRunning = false; 
+
+    if (server_) server_->stop();
+    if (inputQueue_) inputQueue_->stop();
+    if (outputQueue_) outputQueue_->stop();
+
+    if (processingThread_.joinable()) processingThread_.join();
+    if (outputThread_.joinable()) outputThread_.join();
+}
+
 void TradingApp::run() {
     std::signal(SIGINT, signalHandler);
 
-    /**
-     * @pillar PILLAR 1: THE OUTPUT TAPE (I/O Bound)
-     * @details Uses the "Batch Swap" optimization. Instead of waking up for 
-     * every single trade, it sleeps until work is available and then 
-     * flushes everything in a local burst, minimizing syscall overhead.
-     */
+    // Pillar 1: Output Tape (Batch processing remains efficient)
     outputThread_ = std::thread([this]() {
         std::queue<OutputEnvelope> localBatch;
-        
-        while (outputQueue_->pop_all(localBatch)) [[likely]] {
+        while (outputQueue_->pop_all(localBatch)) {
+            if (localBatch.empty()) {
+                // This happens if pop_all was unblocked by a stop signal
+                continue; 
+            }
+
             while (!localBatch.empty()) {
                 const auto& env = localBatch.front();
                 
-                if (env.type == MsgType::Data) [[likely]] {
-                    // Use write() + length for zero-allocation printing
+                // Choose stream and write
+                if (env.type == MsgType::Data) {
                     std::cout.write(env.buffer.data(), env.length);
                 } else {
                     std::cerr.write(env.buffer.data(), env.length);
                 }
                 localBatch.pop();
             }
-            // Flush once per batch to keep the terminal responsive but efficient
+            
+            // CRITICAL: Force the OS to flush the pipe immediately
             std::cout.flush();
+            std::cerr.flush();
+            
+            // Give the OS a microsecond to actually draw to the terminal
+            std::this_thread::yield(); 
         }
     });
 
     /**
-     * @pillar PILLAR 2: THE LOGIC ENGINE (CPU Bound)
-     * @details This is the "Single Writer." It serializes all commands 
-     * from the network into a deterministic sequence of book updates.
-     * keepRunning is an extern in header file, initialized and controlled by the handle_signal defined at the top of the file.
+     * @pillar PILLAR 2: THE LOGIC ENGINE (Hybrid Spin-Yield)
+     * Strategy: Pure Non-Blocking. Spin with pause hints, then yield.
      */
     processingThread_ = std::thread([this]() {
+        const uint32_t SPIN_THRESHOLD = 1000000; // Adjust based on your core speed
+        uint32_t emptyCycles = 0;
+
         while (keepRunning) [[likely]] {
-            auto raw = inputQueue_->pop();
+            auto raw = inputQueue_->try_pop();
             
             if (raw) [[likely]] {
-                // Pass the raw string to the Zero-Allocation parser
                 parser_.parseAndExecute(*raw, engine_);
+                emptyCycles = 0; // Reset as soon as work is found
             } else {
-                break; // Queue was stopped
+                emptyCycles++;
+                if (emptyCycles < SPIN_THRESHOLD) {
+                    // Phase 1: Aggressive Spin with hardware hint
+                    asm volatile("pause" ::: "memory");
+                } else {
+                    // Phase 2: Give up CPU slice to other threads (Network/Output)
+                    std::this_thread::yield();
+                    // Optional: clamp emptyCycles to keep it in the yield phase
+                    emptyCycles = SPIN_THRESHOLD; 
+                }
             }
         }
     });
 
-    /**
-     * @pillar PILLAR 3: THE INPUT GATE (Network Bound)
-     * @details Starts the UDP receiver loops to begin filling the inputQueue_.
-     */
+    // Pillar 3: Network
     server_->start();
     
-    // Main thread enters a low-power wait state until Ctrl+C
     while (keepRunning) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    /**
-     * @section GRACEFUL SHUTDOWN (The Domino Effect)
-     * To ensure no data is lost, we must stop the pillars in order:
-     * 1. Stop Network (No more new data)
-     * 2. Stop Input Queue (Drain the Parser)
-     * 3. Stop Output Queue (Finalize the Tape)
-     */
-    std::cerr << "\nSHUTTING_DOWN: Draining queues..." << std::endl;
-    
-    server_->stop();        // Step 1: Kill network threads
-    inputQueue_->stop();    // Step 2: Signal Parser thread to finish
-    
-    if (processingThread_.joinable()) {
-        processingThread_.join();
-    }
-
-    outputQueue_->stop();   // Step 3: Signal Output thread to finish last trades
-    
-    if (outputThread_.joinable()) {
-        outputThread_.join();
-    }
-    
-    std::cerr << "SHUTDOWN_COMPLETE: Core Engine halted." << std::endl;
+    stop(); 
 }
 
-/**
- * @brief Resets the system state for testing isolation.
- * @details This clears the order books and maps without restarting threads.
- */
 void TradingApp::flushState() {
     engine_.handleFlush(); 
-
+    
     std::queue<std::string> dummyIn;
-    if (!inputQueue_->empty()) {
-        inputQueue_->pop_all(dummyIn);
-    }
+    inputQueue_->pop_all(dummyIn);
 
-    // NEW: Drain the output queue so tests start with a clean slate
     std::queue<OutputEnvelope> dummyOut;
-    if (!outputQueue_->empty()) {
-        outputQueue_->pop_all(dummyOut);
-    }
-    // not fuling up outputQueue_ with this message
-    std::cerr << "ENGINE_EVENT: Engine & Queues Purged ---" << std::endl; 
+    outputQueue_->pop_all(dummyOut);
 }

@@ -68,20 +68,35 @@ bool CSVParser::parseAndExecute(const std::string& raw, TradingEngine& engine) {
      * are the dominant message types.
      */
     if (type == 'N') [[likely]] {
-        // Expected Format: N, symbol, userId, userOrderId, side, quantity, price
-        std::string_view sym_sv = get_token(data);
-        std::string_view uid_sv = get_token(data);
-        std::string_view oid_sv = get_token(data);
-        std::string_view side_sv = get_token(data);
-        std::string_view qty_sv = get_token(data);
-        std::string_view prc_sv = get_token(data);
+        // Sequence: N, userId, symbol, price, quantity, side, userOrderId
+        std::string_view uid_sv  = get_token(data); // 1. userId
+        std::string_view sym_sv  = get_token(data); // 2. symbol
+        std::string_view prc_sv  = get_token(data); // 3. price
+        std::string_view qty_sv = get_token(data); // 4. quantity
+        std::string_view side_sv  = get_token(data); // 5. side
+        std::string_view oid_sv  = get_token(data); // 6. userOrderId
 
+        // 1. Handle Price and OrderType first
+        if (prc_sv == "0") {
+            cmd.orderType = OrderType::MARKET;
+            cmd.price = 0.0;
+        } else {
+            cmd.orderType = OrderType::LIMIT;
+            if (!try_parse_double(prc_sv, cmd.price)) [[unlikely]] {
+                outputHandler_.logError(std::format("Parse Error: Invalid Price: {}", raw));
+                return false;
+            }
+        }
+        // 2. Quantity MUST still be positive (even for Market orders)
+        if (!try_parse_double(qty_sv, cmd.quantity)) [[unlikely]] {
+            outputHandler_.logError(std::format("Parse Error: Invalid Qty: {}", raw));
+            return false;
+        }
         // Fail-Fast: Ensure the CSV line isn't truncated
         if (prc_sv.empty()) [[unlikely]] {
             outputHandler_.logError(std::format("Parse Error: Truncated NEW: {}", raw));
             return false;
         }
-
         /**
          * @note Symbol Validation (12+1 Length)
          * We verify against Config::SYMBOL_LENGTH to prevent buffer overflows 
@@ -106,12 +121,6 @@ bool CSVParser::parseAndExecute(const std::string& raw, TradingEngine& engine) {
         else if (side_sv == "S") cmd.side = Side::SELL;
         else [[unlikely]] {
             outputHandler_.logError(std::format("Parse Error: Invalid Side '{}'", side_sv));
-            return false;
-        }
-
-        // Floating Point Conversion (Price and Quantity)
-        if (!try_parse_double(qty_sv, cmd.quantity) || !try_parse_double(prc_sv, cmd.price)) [[unlikely]] {
-            outputHandler_.logError(std::format("Parse Error: Invalid Qty/Price: {}", raw));
             return false;
         }
     } 
@@ -154,6 +163,10 @@ bool CSVParser::parseAndExecute(const std::string& raw, TradingEngine& engine) {
     return true;
 }
 
+
+
+
+
 bool CSVParser::try_parse_uint64_t(std::string_view sv, uint64_t& value) {
     if (sv.empty()) [[unlikely]] return false;
 
@@ -165,25 +178,10 @@ bool CSVParser::try_parse_uint64_t(std::string_view sv, uint64_t& value) {
 }
 
 bool CSVParser::try_parse_double(std::string_view sv, double& value) {
-    if (sv.empty()) [[unlikely]] return false;
-
-    // 1. Convert text to binary double
+    if (sv.empty()) return false;
     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
-    
-    // Check for parse errors (like "12.34abc")
-    if (ec != std::errc{} || ptr != sv.data() + sv.size()) [[unlikely]] return false;
+    if (ec != std::errc{} || ptr != sv.data() + sv.size()) return false;
 
-    /**
-     * @note SAFETY GUARDS
-     * - isfinite: Rejects NaN, Inf, -Inf
-     * - fpclassify: Rejects Subnormals (tiny numbers that cause latency)
-     * - <= 0.0: Rejects negative values and absolute zero
-     */
-    if (!std::isfinite(value) || 
-        std::fpclassify(value) == FP_SUBNORMAL || 
-        value <= 0.0) [[unlikely]] {
-        return false;
-    }
-
-    return true;
+    // Check only for math validity, not business logic
+    return std::isfinite(value) && std::fpclassify(value) != FP_SUBNORMAL;
 }

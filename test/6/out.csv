@@ -1,2 +1,6 @@
-you own output here
-
+A, 1, 101
+B, S, 2500, 10
+R, 2, 1, "Invalid Price Value"
+A, 2, 2
+T, 2, 2, 1, 101, 2500, 5
+B, S, 2500, 5

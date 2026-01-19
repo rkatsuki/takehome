@@ -1,2 +1,6 @@
-you own output here
-
+A, 1, 101
+B, S, 50000, 10
+R, 2, 1, "Invalid Price Format"
+R, 3, 2, "Invalid Symbol: Control Characters"
+R, 4, 3, "Invalid Symbol: Null Byte"
+R, 5, 4, "Invalid Symbol: Format Error"

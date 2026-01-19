@@ -5,6 +5,7 @@
 #include <charconv>
 #include <array>
 
+#include "Constants.hpp"
 #include "ThreadSafeQueue.hpp"
 
 // EXPECTED OUTPUT 
@@ -118,6 +119,8 @@ private:
      * @details Used for rejections or system warnings. Routed to stderr.
      */
     void logError(std::string_view err) noexcept {
-        enqueue(MsgType::Error, "[ERROR] {}\n", err);
+        if (Config::DEBUG){
+            enqueue(MsgType::Error, "[ERROR] {}\n", err);
+        }
     }
 };
