@@ -166,6 +166,8 @@ docker build -t kraken-orderbook-senior .
 docker run --rm -it --entrypoint /bin/bash kraken-orderbook-senior
 
 # Inside container - start your program
+cmake --build build 
+
 /kraken_submission/build/kraken_submission &
 
 # Send test data (requires BSD netcat)

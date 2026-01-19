@@ -118,35 +118,16 @@ list goes on...
 ## Build, Test & Run Instructions
 
 ### Build with Docker
-```bash
-docker build -t kraken-submission .
-## 🛠️ Build & Run Instructions
-
-### Build with Docker
-```bash
 docker build -t kraken-orderbook-senior .
 
+# Run a shell inside the container
+docker run --rm -it --entrypoint /bin/bash kraken-orderbook-senior
 
----
-
-## 🛠️ Build, Test & Run Instructions
-
-### Build with Docker
-```bash
-docker build -t kraken-submission .
-
-docker run --rm kraken-submission /build/unit_tests
-```
-
-### Build with Docker
-```bash
-# run individual suite
-./build/unit_tests --gtest_filter=MatchingTest.*
-# run specific test case in suite
-./build/unit_tests --gtest_filter=MatchingTest.MarketOrderTest
-```
+# Inside container - build
+cmake --build build 
 
 ### Run integration test
+***Runs all 16 tests : provided tests and custom tests***
 ```bash
 ./build/unit_tests --gtest_filter=*KrakenFileParamTest*
 ```
@@ -155,3 +136,14 @@ docker run --rm kraken-submission /build/unit_tests
 ```bash
 ./build/unit_tests --gtest_filter=KrakenPerformanceSuite.*
 ```
+
+# Run Unit Tests
+```bash
+# run individual suite
+./build/unit_tests --gtest_filter=OrderBookTestSuite.PriceImprovement_BuyTaker
+# run specific test case in suite
+./build/unit_tests --gtest_filter=OrderBookTestSuite.*
+```
+
+# Run
+./build/kraken_submission&

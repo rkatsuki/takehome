@@ -124,6 +124,7 @@ void OrderBook::clear() noexcept {
     asks_.clear();
     lastBid_ = {-1.0, 0.0};
     lastAsk_ = {-1.0, 0.0};
+    setLastTradedPrice(0);
 }
 
 /**
