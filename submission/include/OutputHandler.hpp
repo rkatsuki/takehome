@@ -4,26 +4,11 @@
 #include <format>
 #include <charconv>
 #include <array>
+#include <memory>
 
 #include "Constants.hpp"
 #include "ThreadSafeQueue.hpp"
 
-// EXPECTED OUTPUT 
-// **Order acknowledgement:**
-// A, userId, userOrderId
-// **Cancel acknowledgement:**
-// C, userId, userOrderId
-// **Trade (matched orders):**
-// T, userIdBuy, userOrderIdBuy, userIdSell, userOrderIdSell, price, quantity
-// **Top of Order / BBO
-// B, side (B or S), price, totalQuantity
-
-/**
- * @brief Output Category
- * @details Separating Data from Errors allows the OutputThread to route
- * messages to different streams (stdout vs stderr) without the Engine
- * needing to know about file descriptors.
- */
 enum class MsgType { 
     Data,   // For Kraken CSV responses (stdout)
     Error   // For Diagnostic/Error logs (stderr)
@@ -31,13 +16,8 @@ enum class MsgType {
 
 /**
  * @brief Zero-Allocation Message Carrier
- * @details This struct is specifically designed to be "Trivially Copyable."
- * By using a fixed-size std::array instead of std::string, we ensure that
- * pushing to the ThreadSafeQueue involves a single contiguous memory copy 
- * rather than a heap allocation and pointer indirection.
  */
 struct OutputEnvelope {
-    // 128 bytes fits most Kraken messages and stays within 2 CPU cache lines.
     std::array<char, 128> buffer; 
     size_t length{0};
     MsgType type;
@@ -47,80 +27,110 @@ struct OutputEnvelope {
 };
 
 /**
- * @brief The Asynchronous Output Gateway
- * @details This class acts as a proxy. It formats data into a binary 
- * OutputEnvelope and hands it off to a background thread for printing.
+ * @brief Stack-allocated numeric buffer to avoid heap usage in the hot path.
  */
+struct SmartNum {
+    std::array<char, 32> data;
+    std::string_view view;
+};
+
 class OutputHandler {
 private:
     std::shared_ptr<ThreadSafeQueue<OutputEnvelope>> queue_;
+
     /**
-     * @brief THE HOT-PATH FORMATTER
-     * @details This is the "Secret Sauce" of the zero-allocation strategy.
-     * 1. It creates an 'env' on the STACK.
-     * 2. std::format_to_n writes the string directly into that stack memory.
-     * 3. std::move(env) pushes that block of memory into the queue.
-     * @note noexcept is critical here; since there is no 'new', it cannot throw bad_alloc.
+     * @brief Zero-allocation Smart Formatter
+     * @details Uses std::to_chars for fixed-point 8-decimal precision.
+     * Strips trailing zeros so 100.00000000 becomes "100" and 
+     * 100.00000001 stays "100.00000001".
      */
+    SmartNum formatSmart(double value) noexcept {
+        SmartNum out;
+        // Use fixed format with 8 decimals to satisfy Satoshi precision (Scenario 8)
+        auto [ptr, ec] = std::to_chars(out.data.data(), out.data.data() + out.data.size(), 
+                                       value, std::chars_format::fixed, 8);
+        
+        if (ec != std::errc()) {
+            out.view = "0";
+            return out;
+        }
+
+        char* start = out.data.data();
+        char* end = ptr - 1;
+
+        // Strip trailing zeros
+        while (end > start && *end == '0') {
+            end--;
+        }
+
+        // Strip trailing decimal point if it's now the last character
+        if (end > start && *end == '.') {
+            end--;
+        }
+
+        out.view = std::string_view(start, end - start + 1);
+        return out;
+    }
+
     template <typename... Args>
     void enqueue(MsgType type, std::format_string<Args...> fmt, Args&&... args) noexcept {
         OutputEnvelope env(type);
         
-        // std::format_to_n is the high-performance variant of std::format.
-        // It provides the safety of snprintf with the modern syntax of C++20.
         auto result = std::format_to_n(env.buffer.data(), 
                                        env.buffer.size() - 1, 
                                        fmt, 
                                        std::forward<Args>(args)...);
         
         env.length = result.size;
-        
-        // Safety: Ensure null termination for compatibility with C-style logging if needed.
         env.buffer[env.length] = '\0'; 
         
-        // Move the stack-allocated struct into the thread-safe queue.
         queue_->push(std::move(env));
     }
 
-    public:
-        explicit OutputHandler(std::shared_ptr<ThreadSafeQueue<OutputEnvelope>> queue) : queue_(std::move(queue)) {}
+public:
+    explicit OutputHandler(std::shared_ptr<ThreadSafeQueue<OutputEnvelope>> queue) 
+        : queue_(std::move(queue)) {}
 
-        // --- CSV Outputs (The Execution Hot Path) ---
+    // --- CSV Outputs (The Execution Hot Path) ---
 
-    // Hot-Path Output Methods
     void printAck(int uId, int uOid) noexcept {
-        // Exact match: A, 1, 101
         enqueue(MsgType::Data, "A, {}, {}\n", uId, uOid);
     }
 
+    void printReject(int uId, int uOid, std::string_view reason) noexcept {
+        // Enforce quotes around reason as required by test expectations for Scenario 14/16
+        enqueue(MsgType::Data, "R, {}, {}, \"{}\"\n", uId, uOid, reason);
+    }
+
     void printCancel(int uId, int uOid) noexcept {
-        // Exact match: C, 1, 101
         enqueue(MsgType::Data, "C, {}, {}\n", uId, uOid);
     }
 
     void printTrade(int bId, int bOid, int sId, int sOid, double p, double q) noexcept {
-        // Exact match: T, 1, 3, 2, 102, 11, 100
-        // {:g} handles significant decimals automatically.
-        enqueue(MsgType::Data, "T, {}, {}, {}, {}, {:g}, {:g}\n", bId, bOid, sId, sOid, p, q);
+        // Use formatSmart().view to ensure clean integers or high-precision decimals
+        enqueue(MsgType::Data, "T, {}, {}, {}, {}, {}, {}\n", 
+                bId, bOid, sId, sOid, formatSmart(p).view, formatSmart(q).view);
     }
 
     void printBBO(char side, double p, double q) noexcept {
-        // Exact match: B, B, 10, 100  OR  B, S, -, -
         if (q <= 1e-9) [[unlikely]] {
             enqueue(MsgType::Data, "B, {}, -, -\n", side);
         } else [[likely]] {
-            enqueue(MsgType::Data, "B, {}, {:g}, {:g}\n", side, p, q);
+            enqueue(MsgType::Data, "B, {}, {}, {}\n", side, formatSmart(p).view, formatSmart(q).view);
         }
     }
+
     // --- Diagnostics (The Cold Path) ---
 
-    /**
-     * @brief Error Logging
-     * @details Used for rejections or system warnings. Routed to stderr.
-     */
     void logError(std::string_view err) noexcept {
-        if (Config::DEBUG){
+        if (Config::DEBUG) {
             enqueue(MsgType::Error, "[ERROR] {}\n", err);
+        }
+    }
+
+    void logInfo(std::string_view info) noexcept {
+        if (Config::DEBUG) {
+            enqueue(MsgType::Error, "[INFO] {}\n", info);
         }
     }
 };

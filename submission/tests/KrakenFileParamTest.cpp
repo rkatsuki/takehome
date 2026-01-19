@@ -150,7 +150,8 @@ std::vector<FilePair> GenerateAllScenarios() {
     for (int i = 1; i <= 16; ++i) {
         // Use "expected.csv" for all, assuming you named your custom outputs 
         // to match the challenge's naming convention for ground truth.
-        std::string folder = "/test/" + std::to_string(i);
+        // std::string folder = "/test/" + std::to_string(i);   // project root foler
+        std::string folder = "./tests/data/" + std::to_string(i);   // submission folder
         scenarios.push_back({
             folder + "/in.csv", 
             folder + "/out.csv", // Adjusted to 'expected.csv' based on typical Kraken naming

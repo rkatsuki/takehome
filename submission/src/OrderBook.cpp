@@ -22,7 +22,7 @@ OrderBook::OrderBook(Symbol symbol, OutputHandler& handler)
  * consumption before resting the residual.
  */
 void OrderBook::execute(Command& cmd, std::unordered_map<OrderKey, OrderLocation>& registry) noexcept {
-    std::cerr << "[DEBUG] Execute called for ID: " << cmd.userOrderId << " Type: " << (int)cmd.type << std::endl;
+    // std::cerr << "[DEBUG] Execute called for ID: " << cmd.userOrderId << " Type: " << (int)cmd.type << std::endl;
     // Requirement: Every order must be acknowledged upon receipt.
     // We do this before matching to minimize Taker-perceived latency.
     if (cmd.type == CommandType::NEW) [[likely]] {
@@ -34,7 +34,7 @@ void OrderBook::execute(Command& cmd, std::unordered_map<OrderKey, OrderLocation
          * BUY matches against ASKS; SELL matches against BIDS.
          */
         if (cmd.side == Side::BUY) [[likely]] {
-            std::cerr << "[DEBUG] Attempting Buy match against " << asks_.size() << " ask levels" << std::endl;
+            // std::cerr << "[DEBUG] Attempting Buy match against " << asks_.size() << " ask levels" << std::endl;
             matchAgainstSide(cmd, asks_, registry);
         } else {
             matchAgainstSide(cmd, bids_, registry);
@@ -55,7 +55,7 @@ void OrderBook::execute(Command& cmd, std::unordered_map<OrderKey, OrderLocation
     }
 
     // Every execution potentially changes the top of book.
-    checkAndPublishBBO();
+    checkAndPublishBBO(false);
 }
 
 /**
@@ -83,15 +83,31 @@ void OrderBook::cancel(const OrderKey& key, std::unordered_map<OrderKey, OrderLo
  * redundant I/O messages when fills happen deep in the book without 
  * touching the Best Price/Volume.
  */
-void OrderBook::checkAndPublishBBO() noexcept {
+void OrderBook::checkAndPublishBBO(bool force) noexcept {
     auto updateBBO = [&](auto& sideMap, BBO& lastBBO, char sideCode) {
-        // Price maps are sorted; begin() is always the 'Best' price.
-        BBO current = sideMap.empty() ? BBO{-1.0, 0.0} : 
-                                        BBO{sideMap.begin()->first, sideMap.begin()->second.totalVolume};
-        
-        if (current.price != lastBBO.price || current.volume != lastBBO.volume) [[likely]] {
-            outputHandler_.printBBO(sideCode, current.price, current.volume);
-            lastBBO = current;
+        if (sideMap.empty()) {
+            // Only print if the book was previously not empty
+            if (lastBBO.price != -1.0) {
+                outputHandler_.printBBO(sideCode, 0, 0); 
+                lastBBO = {-1.0, 0.0};
+            }
+            return;
+        }
+
+        // map::begin() is O(1)
+        auto it = sideMap.begin();
+        double currentPrice = it->first;
+        double currentVol = it->second.totalVolume;
+
+        // Use your Precision namespace for bulletproof comparison
+        bool priceChanged = !Precision::isEqual(currentPrice, lastBBO.price);
+        bool volChanged   = !Precision::isEqual(currentVol, lastBBO.volume);
+
+        if (priceChanged || volChanged) {
+            outputHandler_.printBBO(sideCode, currentPrice, currentVol);
+            // Cache the new state for the next comparison
+            lastBBO.price = currentPrice;
+            lastBBO.volume = currentVol;
         }
     };
 
@@ -264,7 +280,7 @@ void OrderBook::removeFromSide(T& sideMap, const OrderLocation& loc, const Order
     }
     outputHandler_.printCancel(key.userId, key.userOrderId);
     registry.erase(regIt);
-    checkAndPublishBBO();
+    checkAndPublishBBO(false);
 }
 
 /**

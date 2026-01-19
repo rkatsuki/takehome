@@ -40,8 +40,8 @@ void TradingEngine::processCommand(Command& cmd) {
             // Check for negative prices, zero quantity, etc., before touching the book.
             std::string errorReason;
             if (!validateOrder(cmd, errorReason)) [[unlikely]] {
-                outputHandler_.logError(std::format("REJECT: User {} Order {} - {}", 
-                                       cmd.userId, cmd.userOrderId, errorReason));
+                // This generates the specific "R, uId, oId, reason" line for GTest
+                outputHandler_.printReject(cmd.userId, cmd.userOrderId, errorReason);
                 return;
             }
             
@@ -130,9 +130,16 @@ OrderBook& TradingEngine::getOrCreateBook(Symbol symbol) {
  */
 bool TradingEngine::validateOrder(const Command& cmd, std::string& outError) {
     
+    // If the key exists in the registry, the order is already live!
+    OrderKey key{cmd.userId, cmd.userOrderId};
+    if (registry_.find(key) != registry_.end()) [[unlikely]] {
+        outError = "Duplicate Order ID";
+        return false;
+    }
+    
     // 1. Basic Guardrails (Always apply)
     if (!Config::isSupported(cmd.symbol.data)) [[unlikely]] {
-        outError = "INVALID_SYMBOL";
+        outError = "Symbol Not Whitelisted";
         return false;
     }
 
@@ -141,9 +148,13 @@ bool TradingEngine::validateOrder(const Command& cmd, std::string& outError) {
         return false;
     }
 
-    // Quantity is required for both Market and Limit orders
-    if (cmd.quantity < Config::MIN_ORDER_QTY - Precision::EPSILON) [[unlikely]] {
-        outError = "QUANTITY_TOO_LOW";
+    // Quantity bnoundaries 
+    if (cmd.quantity > static_cast<double>(Config::MAX_ORDER_QTY)) [[unlikely]] {
+        outError = "Invalid Quantity: Overflow";
+        return false;
+    }
+    if (cmd.quantity < Config::MIN_ORDER_QTY) [[unlikely]] {
+        outError = "Invalid Quantity";
         return false;
     }
 
@@ -152,12 +163,12 @@ bool TradingEngine::validateOrder(const Command& cmd, std::string& outError) {
         * If price is 0.0, it is a Market Order. We skip corridor and 
         * price-level checks because Market orders do not sit on the book.
         */
-    if (!Precision::isZero(cmd.price)) {
+    if (cmd.orderType==OrderType::LIMIT) {
         
         // Limit Price Magnitude Check
         if (cmd.price < Config::MIN_ORDER_PRICE - Precision::EPSILON || 
             cmd.price > Config::MAX_ORDER_PRICE + Precision::EPSILON) [[unlikely]] {
-            outError = "PRICE_OUT_OF_BOUNDS";
+            outError = "Invalid Price: Numeric Limit";
             return false;
         }
 
@@ -173,7 +184,7 @@ bool TradingEngine::validateOrder(const Command& cmd, std::string& outError) {
 
             if (cmd.price < lowerBound - Precision::EPSILON || 
                 cmd.price > upperBound + Precision::EPSILON) [[unlikely]] {
-                outError = "PRICE_OUTSIDE_VOLATILITY_CORRIDOR";
+                outError =  "Price Outside Corridor";
                 return false;
             }
         }

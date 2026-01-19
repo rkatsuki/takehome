@@ -39,7 +39,7 @@ private:
     /**
      * @brief Publishes BBO updates only if the top-of-book has changed.
      */
-    void checkAndPublishBBO() noexcept;
+    void checkAndPublishBBO(bool force) noexcept;
 
     /**
      * @brief Logic for matching a Taker against Maker liquidity.

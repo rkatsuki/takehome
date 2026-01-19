@@ -100,7 +100,7 @@ TEST_F(CSVParserTestSuite, FullPath_AcceptValidFlush) {
 }
 
 TEST_F(CSVParserTestSuite, FullPath_WhitespaceResilience) {
-    std::string messy = " N ,  ETHUSD  , 2 , 2002 , S , 0.5 , 3000.0 ";
+    std::string messy = " N,    1,    IBM,    10,    100, B, 1";
     EXPECT_TRUE(parser.parseAndExecute(messy, engine));
 }
 

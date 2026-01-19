@@ -76,51 +76,54 @@ bool CSVParser::parseAndExecute(const std::string& raw, TradingEngine& engine) {
         std::string_view side_sv  = get_token(data); // 5. side
         std::string_view oid_sv  = get_token(data); // 6. userOrderId
 
+        if (oid_sv.empty()) [[unlikely]] {
+            outputHandler_.printReject(0, 0, "Incommplete or Malformed Request");
+            return false;
+        }
+
+        // Binary Conversion for IDs
+        if (!try_parse_uint64_t(uid_sv, cmd.userId) || !try_parse_uint64_t(oid_sv, cmd.userOrderId)) [[unlikely]] {
+            // Ids are invalid, so we don't know who to send the error to!
+            outputHandler_.printReject(0, 0, "Invalid ID");
+            return false;
+        }
+
         // 1. Handle Price and OrderType first
-        if (prc_sv == "0") {
+        if (!try_parse_double(prc_sv, cmd.price)) {
+            outputHandler_.printReject(cmd.userId, cmd.userOrderId, "Invalid Price Value");
+            return false;
+        }
+
+        // Check if the price is exactly 0, if so Market Order
+        if (cmd.price == 0.0) {
             cmd.orderType = OrderType::MARKET;
-            cmd.price = 0.0;
         } else {
             cmd.orderType = OrderType::LIMIT;
-            if (!try_parse_double(prc_sv, cmd.price)) [[unlikely]] {
-                outputHandler_.logError(std::format("Parse Error: Invalid Price: {}", raw));
-                return false;
-            }
         }
+
         // 2. Quantity MUST still be positive (even for Market orders)
         if (!try_parse_double(qty_sv, cmd.quantity)) [[unlikely]] {
-            outputHandler_.logError(std::format("Parse Error: Invalid Qty: {}", raw));
+            outputHandler_.printReject(cmd.userId, cmd.userOrderId, "Invalid Quantity: Malformed");
             return false;
         }
-        // Fail-Fast: Ensure the CSV line isn't truncated
-        if (prc_sv.empty()) [[unlikely]] {
-            outputHandler_.logError(std::format("Parse Error: Truncated NEW: {}", raw));
-            return false;
-        }
+
         /**
          * @note Symbol Validation (12+1 Length)
          * We verify against Config::SYMBOL_LENGTH to prevent buffer overflows 
          * when initializing the fixed-width Symbol struct.
          */
         if (sym_sv.empty() || sym_sv.length() > Config::SYMBOL_LENGTH) [[unlikely]] {
-            outputHandler_.logError(std::format("Parse Error: Symbol length {} invalid (Max {}): {}", 
-                              sym_sv.length(), Config::SYMBOL_LENGTH, sym_sv));
+            outputHandler_.printReject(cmd.userId, cmd.userOrderId, "Invalid Symbol: Buffer Limit");
             return false;
         }
         cmd.symbol = Symbol(sym_sv);
         cmd.type = CommandType::NEW;
         
-        // Binary Conversion for IDs
-        if (!try_parse_uint64_t(uid_sv, cmd.userId) || !try_parse_uint64_t(oid_sv, cmd.userOrderId)) [[unlikely]] {
-            outputHandler_.logError(std::format("Parse Error: Invalid ID in NEW: {}", raw));
-            return false;
-        }
-
         // Side Mapping
         if (side_sv == "B") cmd.side = Side::BUY;
         else if (side_sv == "S") cmd.side = Side::SELL;
         else [[unlikely]] {
-            outputHandler_.logError(std::format("Parse Error: Invalid Side '{}'", side_sv));
+            outputHandler_.printReject(cmd.userId, cmd.userOrderId, "Invalid Side");
             return false;
         }
     } 
@@ -179,9 +182,13 @@ bool CSVParser::try_parse_uint64_t(std::string_view sv, uint64_t& value) {
 
 bool CSVParser::try_parse_double(std::string_view sv, double& value) {
     if (sv.empty()) return false;
+    
+    // std::from_chars is excellent, but it returns errc::invalid_argument for "NaN"
     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
-    if (ec != std::errc{} || ptr != sv.data() + sv.size()) return false;
-
-    // Check only for math validity, not business logic
-    return std::isfinite(value) && std::fpclassify(value) != FP_SUBNORMAL;
+    
+    if (ec != std::errc{} || ptr != sv.data() + sv.size() || !std::isfinite(value)) {
+        value = -1.0; // Set poison value
+        return false; // Still return false to let the caller know it's "bad"
+    }
+    return true;
 }

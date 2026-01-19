@@ -52,7 +52,7 @@ endif()
 add_executable(kraken_submission ${SOURCE_DIR}/main.cpp)
 target_link_libraries(kraken_submission PRIVATE trading_engine_core)
 
-# --- PILLAR 6: TESTING FRAMEWORK ---
+# --- PILLAR 6: UNIT TEST / INTEG / PERFORMANCE TEST ---
 enable_testing()
 find_package(GTest QUIET)
 if(GTest_FOUND)
@@ -70,3 +70,4 @@ if(GTest_FOUND)
         gtest_discover_tests(unit_tests)
     endif()
 endif()
+

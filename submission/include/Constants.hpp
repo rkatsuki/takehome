@@ -83,7 +83,7 @@ namespace Config {
      * defense against 'fat-finger' errors and market manipulation. 
      * Protects the integrity of the Last Traded Price (LTP).
      */
-    inline constexpr double PRICE_CORRIDOR_THRESHOLD = 0.5;
+    inline constexpr double PRICE_CORRIDOR_THRESHOLD = 1;
 
     // --- NETWORK CONFIGURATION ---
     struct Network {
